@@ -6,6 +6,8 @@ The MVP uses one storage volume, one coordinated batching writer, concurrent ver
 
 See the [performance improvements and rerun](benchmarks/IMPROVEMENTS.md) and original [Pelagia KVStore2 comparison](benchmarks/COMPARISON.md) for measured read/write tradeoffs, review findings, and a reproducible benchmark harness.
 
+Download native binaries from [GitHub Releases](https://github.com/Icy-Seas-Co-Laboratory/skerrykv/releases/latest). See [installation and release instructions](docs/RELEASES.md).
+
 ## Development and native startup
 
 Install stable Rust (minimum 1.90 for the locked dependencies), native C/C++ build tools, and CMake for the MCP TLS backend. Packaged executables need none of these build tools.
@@ -32,7 +34,7 @@ cargo build --release --locked
 ./target/release/skerry serve --config ./archive/config.toml
 ```
 
-On Windows use `.\target\release\skerry.exe`. Native deployments run in the foreground; use your operating system's service manager if needed. CI builds archives for Windows x86-64, Linux x86-64, and Linux ARM64, including the executable and example configuration.
+On Windows use `.\target\release\skerry.exe`. Native deployments run in the foreground; use your operating system's service manager if needed. CI tests and packages Windows x86-64, Linux x86-64/ARM64, and macOS Intel/Apple Silicon. Version tags publish verified archives and checksums to GitHub Releases.
 
 ```sh
 skerry health

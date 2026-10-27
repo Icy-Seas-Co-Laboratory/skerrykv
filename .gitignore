@@ -13,3 +13,8 @@ core
 /kv2-compare-*/
 /kv2-fullsync-*/
 /benchmarks/__pycache__/
+
+# Local release tooling output
+/dist/
+/scripts/__pycache__/
+/tests/__pycache__/

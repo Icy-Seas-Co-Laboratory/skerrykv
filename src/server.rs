@@ -1237,7 +1237,12 @@ mod tests {
         .expect("eight small writes should fill one writer batch")
         .unwrap();
         assert_eq!(bytes.len(), 9 * (4 + FRAME_HEADER_LEN));
-        for (i, frame) in bytes.chunks_exact(4 + FRAME_HEADER_LEN).enumerate() {
+        for (i, frame) in bytes
+            .as_chunks::<{ 4 + FRAME_HEADER_LEN }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             if i < 8 {
                 assert_eq!(frame[8], RESULT_PUT);
                 assert_eq!(frame[9], 0);
@@ -1298,7 +1303,12 @@ mod tests {
         assert_eq!(dispatched.load(Ordering::SeqCst), 3);
         assert_eq!(budget.available_permits(), 16);
         assert_eq!(bytes.len(), 3 * (4 + FRAME_HEADER_LEN));
-        for (i, frame) in bytes.chunks_exact(4 + FRAME_HEADER_LEN).enumerate() {
+        for (i, frame) in bytes
+            .as_chunks::<{ 4 + FRAME_HEADER_LEN }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             assert_eq!(frame[8], RESULT_PUT);
             assert_eq!(frame[9], if i == 0 { 6 } else { 0 });
             assert_eq!(

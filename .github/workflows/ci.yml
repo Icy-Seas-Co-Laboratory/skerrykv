@@ -1,67 +1,14 @@
 name: CI
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        rust: [stable]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo build --release --bin skerry
-      - if: runner.os == 'Windows'
-        run: |
-          Copy-Item config.example.toml target/release/config.example.toml
-          Compress-Archive -Path target/release/skerry.exe,target/release/config.example.toml -DestinationPath skerry-windows-x86_64.zip
-      - if: runner.os == 'Linux'
-        run: |
-          cp config.example.toml target/release/config.example.toml
-          tar -czf skerry-linux-x86_64.tar.gz -C target/release skerry config.example.toml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: skerry-${{ runner.os }}-x86_64
-          path: skerry-*
-  linux-arm64:
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --bin skerry
-      - run: cargo test --all-targets
-      - run: |
-          cp config.example.toml target/release/config.example.toml
-          tar -czf skerry-linux-aarch64.tar.gz -C target/release skerry config.example.toml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: skerry-linux-aarch64
-          path: skerry-linux-aarch64.tar.gz
-  docker-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t skerrykv:ci .
-      - run: |
-          docker run -d --name skerry-smoke -p 127.0.0.1:7788:7788 \
-            -e SKERRY_TOKEN=ci-test-token skerrykv:ci
-          for attempt in $(seq 1 30); do
-            if docker exec skerry-smoke skerry health --url http://127.0.0.1:7788; then exit 0; fi
-            sleep 1
-          done
-          docker logs skerry-smoke
-          exit 1
-      - if: always()
-        run: docker rm -f skerry-smoke || true
+  validate:
+    uses: ./.github/workflows/build.yml
