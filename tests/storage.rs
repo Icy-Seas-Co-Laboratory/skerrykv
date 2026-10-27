@@ -31,6 +31,34 @@ fn files(c: &Config) -> Vec<std::path::PathBuf> {
     out.sort();
     out
 }
+/// Create an empty, valid legacy activation before writing legacy records.
+/// No deletion history exists at this point, so this is a v1 fixture rather
+/// than a downgrade of a store that has acknowledged v2 mutations.
+fn initialize_legacy(c: &Config) {
+    drop(Store::open(c).unwrap());
+    let mut activations: Vec<_> = fs::read_dir(c.storage.root.join("index"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("activation-")
+        })
+        .collect();
+    activations.sort();
+    let activation = activations.last().unwrap();
+    let bytes = fs::read(activation).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 4]).unwrap();
+    let journal = value["journal"].as_str().unwrap().to_owned();
+    value["version"] = 1.into();
+    value.as_object_mut().unwrap().remove("journal");
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    fs::write(activation, bytes).unwrap();
+    fs::remove_file(c.storage.root.join("format-v2")).unwrap();
+    fs::remove_file(c.storage.root.join(journal)).unwrap();
+}
 
 #[test]
 fn roundtrip_digest_empty_large_restart_and_dedup() {
@@ -178,6 +206,7 @@ fn strict_rebuild_excludes_active_salvage_recovers_verified_prefix() {
     let d = TempDir::new().unwrap();
     let mut c = config(&d);
     c.segments.growth_factor = 2;
+    initialize_legacy(&c);
     let store = Store::open(&c).unwrap();
     let h = store
         .put_many(&[Bytes::from_static(b"salvage me")])
@@ -193,6 +222,33 @@ fn strict_rebuild_excludes_active_salvage_recovers_verified_prefix() {
     assert_eq!(r["objects"], 1);
     let store = Store::open(&c).unwrap();
     assert_eq!(store.get(&h).unwrap().unwrap(), b"salvage me");
+}
+#[test]
+fn legacy_upgrade_is_explicit_and_preserves_committed_objects() {
+    let directory = TempDir::new().unwrap();
+    let config = config(&directory);
+    initialize_legacy(&config);
+    let store = Store::open(&config).unwrap();
+    assert!(!store.deletion_enabled());
+    let hash = store
+        .put_many(&[Bytes::from_static(b"legacy data")])
+        .unwrap()[0]
+        .hash;
+    assert!(store.delete(&hash).is_err());
+    assert_eq!(store.get(&hash).unwrap().unwrap(), b"legacy data");
+    // Rejecting unsupported deletion must leave ordinary legacy writes usable.
+    store
+        .put_many(&[Bytes::from_static(b"still writable")])
+        .unwrap();
+    drop(store);
+    Store::upgrade(&config).unwrap();
+    let store = Store::open(&config).unwrap();
+    assert!(store.deletion_enabled());
+    assert_eq!(store.get(&hash).unwrap().unwrap(), b"legacy data");
+    assert!(store.delete(&hash).unwrap().deleted);
+    drop(store);
+    Store::rebuild(&config, false).unwrap();
+    assert!(!Store::open(&config).unwrap().exists(&hash).unwrap());
 }
 #[test]
 fn sealed_import_deduplicates_preserves_source_and_is_idempotent() {

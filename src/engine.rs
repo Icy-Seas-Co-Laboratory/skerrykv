@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+mod maintenance;
+use maintenance::{Journal, Mutation};
 
 pub const SEGMENT_HEADER: u64 = 64;
 pub const RECORD_HEADER: u64 = 64;
@@ -25,6 +27,11 @@ const SEG_MAGIC: &[u8; 8] = b"SKRYSEG1";
 const REC_MAGIC: &[u8; 8] = b"SKRYREC1";
 const END_MAGIC: &[u8; 8] = b"SKRYEND1";
 
+#[derive(Clone, Debug)]
+pub struct DeleteResult {
+    pub hash: [u8; 32],
+    pub deleted: bool,
+}
 #[derive(Clone, Debug)]
 pub struct PutResult {
     pub hash: [u8; 32],
@@ -59,6 +66,8 @@ struct Meta {
     created: u64,
     sealed: u64,
     digest: Option<[u8; 32]>,
+    garbage_since: u64,
+    compacted: u64,
 }
 struct Active {
     file: File,
@@ -74,6 +83,23 @@ struct FileCache {
     max: usize,
 }
 
+struct FileLease<'a> {
+    file: Option<Arc<File>>,
+    available: &'a Condvar,
+}
+impl std::ops::Deref for FileLease<'_> {
+    type Target = File;
+    fn deref(&self) -> &File {
+        self.file.as_ref().unwrap()
+    }
+}
+impl Drop for FileLease<'_> {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        self.available.notify_all();
+    }
+}
+
 pub struct Store {
     // Keep ownership until all other fields have dropped, including Fjall handles.
     db: Database,
@@ -86,6 +112,11 @@ pub struct Store {
     files: Mutex<FileCache>,
     files_available: Condvar,
     object_count: AtomicU64,
+    gc_pressure: AtomicBool,
+    journal: Option<Mutex<Journal>>,
+    tombstones: Keyspace,
+    retired: Keyspace,
+    maintenance: Mutex<()>,
     _lock: File,
 }
 
@@ -203,6 +234,7 @@ fn parse_footer(b: &[u8]) -> Result<Footer> {
         end: u64_at(b, 28),
         count: u64_at(b, 36),
         sealed: u64_at(b, 44),
+
         digest: b[52..84].try_into().unwrap(),
     })
 }
@@ -230,7 +262,8 @@ fn decode_loc(b: &[u8]) -> Result<Location> {
     Ok(l)
 }
 fn encode_meta(m: &Meta) -> Vec<u8> {
-    let mut b = vec![1, m.state];
+    let extended = m.garbage_since != 0 || m.compacted != 0;
+    let mut b = vec![if extended { 2 } else { 1 }, m.state];
     b.extend_from_slice(&(m.path.len() as u16).to_le_bytes());
     for v in [m.physical, m.end, m.count, m.live, m.created, m.sealed] {
         b.extend_from_slice(&v.to_le_bytes());
@@ -238,16 +271,21 @@ fn encode_meta(m: &Meta) -> Vec<u8> {
     b.push(u8::from(m.digest.is_some()));
     b.extend_from_slice(&m.digest.unwrap_or([0; 32]));
     b.extend_from_slice(m.path.as_bytes());
+    if extended {
+        b.extend_from_slice(&m.garbage_since.to_le_bytes());
+        b.extend_from_slice(&m.compacted.to_le_bytes());
+    }
     b
 }
 fn decode_meta(id: Uuid, b: &[u8]) -> Result<Meta> {
     ensure!(
-        b.len() >= 85 && b[0] == 1 && b[1] <= 2,
+        b.len() >= 85 && (b[0] == 1 || b[0] == 2) && b[1] <= 2,
         "invalid segment metadata version/state"
     );
     let n = u16_at(b, 2) as usize;
-    ensure!(b.len() == 85 + n, "invalid segment metadata length");
-    let path = String::from_utf8(b[85..].to_vec())?;
+    let extra = if b[0] == 2 { 16 } else { 0 };
+    ensure!(b.len() == 85 + n + extra, "invalid segment metadata length");
+    let path = String::from_utf8(b[85..85 + n].to_vec())?;
     validate_relative(&path)?;
     ensure!(path == relative(id), "noncanonical segment path");
     ensure!(b[52] <= 1, "invalid segment digest flag");
@@ -266,6 +304,8 @@ fn decode_meta(id: Uuid, b: &[u8]) -> Result<Meta> {
         live: u64_at(b, 28),
         created: u64_at(b, 36),
         sealed: u64_at(b, 44),
+        garbage_since: if extra > 0 { u64_at(b, 85 + n) } else { 0 },
+        compacted: if extra > 0 { u64_at(b, 93 + n) } else { 0 },
         digest: if b[52] == 1 {
             Some(b[53..85].try_into().unwrap())
         } else {
@@ -358,6 +398,8 @@ struct Activation {
     version: u8,
     generation: String,
     sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal: Option<String>,
 }
 fn activation_files(root: &Path) -> Result<Vec<PathBuf>> {
     let index = root.join("index");
@@ -377,11 +419,7 @@ fn activation_files(root: &Path) -> Result<Vec<PathBuf>> {
     files.sort();
     Ok(files)
 }
-fn selected_generation(root: &Path) -> Result<Option<PathBuf>> {
-    let files = activation_files(root)?;
-    let Some(path) = files.last() else {
-        return Ok(None);
-    };
+fn read_activation(path: &Path) -> Result<Activation> {
     let b = fs::read(path)?;
     ensure!(
         b.len() > 4,
@@ -393,11 +431,75 @@ fn selected_generation(root: &Path) -> Result<Option<PathBuf>> {
     );
     let a: Activation = serde_json::from_slice(&b[..b.len() - 4])?;
     ensure!(
-        a.version == 1
+        (a.version == 1 || a.version == 2)
             && a.generation.starts_with("generation-")
             && Path::new(&a.generation).components().count() == 1,
         "invalid activation record"
     );
+    if a.version == 2 {
+        let journal = a
+            .journal
+            .as_ref()
+            .context("v2 activation missing journal")?;
+        ensure!(
+            journal.starts_with("journal-") && Path::new(journal).components().count() == 1,
+            "invalid mutation journal path"
+        );
+    }
+    Ok(a)
+}
+fn selected_activation(root: &Path) -> Result<Option<Activation>> {
+    let indexed = activation_files(root)?
+        .last()
+        .map(|p| read_activation(p))
+        .transpose()?;
+    let marker = root.join("format-v2");
+    let fallback = if marker.exists() {
+        Some(read_activation(&marker)?)
+    } else {
+        None
+    };
+    match (indexed, fallback) {
+        (Some(a), Some(marker)) => {
+            ensure!(
+                marker.version == 2 && a.version == 2,
+                "activation contradicts v2 root marker; refusing format rollback"
+            );
+            if a.sequence == marker.sequence {
+                ensure!(
+                    a.generation == marker.generation && a.journal == marker.journal,
+                    "conflicting activation records at same sequence"
+                );
+            }
+            Ok(Some(if marker.sequence > a.sequence {
+                marker
+            } else {
+                a
+            }))
+        }
+        (a, None) => Ok(a),
+        (None, marker) => Ok(marker),
+    }
+}
+fn sync_root_marker(root: &Path, activation: &Activation) -> Result<()> {
+    let mut bytes = serde_json::to_vec(activation)?;
+    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    let temp = root.join(format!(".format-v2-{}.tmp", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, root.join("format-v2"))?;
+    sync_dir(root)?;
+    Ok(())
+}
+fn selected_generation(root: &Path) -> Result<Option<PathBuf>> {
+    let Some(a) = selected_activation(root)? else {
+        return Ok(None);
+    };
     let generation = root.join("index").join(a.generation);
     ensure!(
         generation.join("version").exists(),
@@ -406,22 +508,18 @@ fn selected_generation(root: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(generation))
 }
 fn activate(root: &Path, generation: &Path) -> Result<()> {
+    activate_version(root, generation, None)
+}
+fn activate_version(root: &Path, generation: &Path, journal: Option<&str>) -> Result<()> {
     let index = root.join("index");
     fs::create_dir_all(&index)?;
-    let sequence = activation_files(root)?
-        .last()
-        .and_then(|p| {
-            p.file_stem()?
-                .to_str()?
-                .strip_prefix("activation-")?
-                .parse::<u64>()
-                .ok()
-        })
-        .unwrap_or(0)
+    let sequence = selected_activation(root)?
+        .map_or(0, |a| a.sequence)
         .checked_add(1)
         .context("activation sequence exhausted")?;
     let a = Activation {
-        version: 1,
+        version: if journal.is_some() { 2 } else { 1 },
+        journal: journal.map(str::to_owned),
         generation: generation
             .file_name()
             .context("generation path")?
@@ -445,6 +543,10 @@ fn activate(root: &Path, generation: &Path) -> Result<()> {
     failpoint("before_activation")?;
     fs::rename(&temp, &final_path)?;
     sync_dir(&index)?;
+    failpoint("activation_before_marker")?;
+    if journal.is_some() {
+        sync_root_marker(root, &a)?;
+    }
     failpoint("after_activation")?;
     Ok(())
 }
@@ -622,6 +724,8 @@ fn scan_file(path: &Path, root: &Path, salvage: bool, canonical: bool) -> Result
             created,
             sealed: footer.as_ref().map_or(0, |f| f.sealed),
             digest: footer.map(|f| f.digest),
+            garbage_since: 0,
+            compacted: 0,
         },
     }))
 }
@@ -681,10 +785,33 @@ impl Store {
             }
         };
         let (db, objects, segments) = open_db(&generation, config)?;
+        let tombstones = db.keyspace("tombstones", KeyspaceCreateOptions::default)?;
+        let retired = db.keyspace("retired", KeyspaceCreateOptions::default)?;
+        let journal = if new {
+            Some(Journal::create(&root)?)
+        } else {
+            selected_activation(&root)?
+                .filter(|a| a.version == 2)
+                .map(|a| {
+                    if repair {
+                        Journal::open(&root, a.journal.as_deref().unwrap())
+                    } else {
+                        Journal::read_only(&root, a.journal.as_deref().unwrap())
+                    }
+                })
+                .transpose()?
+        };
+        if repair && let Some(journal) = &journal {
+            journal.replay(&db, &objects, &segments, &tombstones, &retired)?;
+        }
         if new {
             db.persist(PersistMode::SyncAll)?;
             sync_dir(&generation)?;
-            activate(&root, &generation)?;
+            activate_version(
+                &root,
+                &generation,
+                journal.as_ref().map(|j| j.name.as_str()),
+            )?;
         }
         let store = Self {
             db,
@@ -700,8 +827,20 @@ impl Store {
             }),
             files_available: Condvar::new(),
             object_count: AtomicU64::new(0),
+            gc_pressure: AtomicBool::new(false),
+            journal: journal.map(Mutex::new),
+            tombstones,
+            retired,
+            maintenance: Mutex::new(()),
             _lock: lock,
         };
+        if repair && store.deletion_enabled() {
+            // Reconcile selection and finish known retirements before scanning
+            // physical orphan files; retired bytes need no further validation.
+            let activation = selected_activation(&store.root)?.context("missing v2 activation")?;
+            sync_root_marker(&store.root, &activation)?;
+            store.cleanup_retired()?;
+        }
         store.recover(repair)?;
         Ok(store)
     }
@@ -798,19 +937,17 @@ impl Store {
                     }
                 }
                 if sealed && repair {
-                    self.segments.insert(id.as_bytes(), encode_meta(&meta))?;
-                    self.db.persist(PersistMode::SyncAll)?;
+                    self.publish(&[Mutation::segment(&meta)])?;
                 } else if !sealed {
                     ensure!(
                         writer.active.is_none(),
                         "multiple active segments in single-volume store"
                     );
-                    if repair {
+                    if repair && (physical != meta.end || meta.physical != meta.end) {
                         file.set_len(meta.end)?;
                         file.sync_all()?;
                         meta.physical = meta.end;
-                        self.segments.insert(id.as_bytes(), encode_meta(&meta))?;
-                        self.db.persist(PersistMode::SyncAll)?;
+                        self.publish(&[Mutation::segment(&meta)])?;
                     }
                     file.seek(SeekFrom::Start(meta.end))?;
                     writer.active = Some(Active {
@@ -888,10 +1025,11 @@ impl Store {
             created,
             sealed: 0,
             digest: None,
+            garbage_since: 0,
+            compacted: 0,
         };
         let _visible = self.visibility.write();
-        self.segments.insert(id.as_bytes(), encode_meta(&meta))?;
-        self.db.persist(PersistMode::SyncAll)?;
+        self.publish(&[Mutation::segment(&meta)])?;
         writer.active = Some(Active { file, meta });
         Ok(())
     }
@@ -915,9 +1053,7 @@ impl Store {
         a.meta.physical = a.meta.end + 96;
         a.meta.digest = Some(digest);
         let _visible = self.visibility.write();
-        self.segments
-            .insert(a.meta.id.as_bytes(), encode_meta(&a.meta))?;
-        self.db.persist(PersistMode::SyncAll)?;
+        self.publish(&[Mutation::segment(&a.meta)])?;
         Ok(())
     }
     pub fn put_many(&self, payloads: &[Bytes]) -> Result<Vec<PutResult>> {
@@ -1023,17 +1159,18 @@ impl Store {
         a.file.sync_all()?;
         failpoint("after_segment_sync")?;
         let _visible = self.visibility.write();
-        let mut batch = self.db.batch();
-        for (hash, l) in pending.iter() {
-            batch.insert(&self.objects, hash, encode_loc(*l));
-        }
-        batch.insert(&self.segments, a.meta.id.as_bytes(), encode_meta(&a.meta));
+        let mut changes: Vec<_> = pending
+            .iter()
+            .map(|(hash, l)| Mutation::Put {
+                hash: *hash,
+                location: encode_loc(*l),
+            })
+            .collect();
+        changes.push(Mutation::segment(&a.meta));
         failpoint("before_index_commit")?;
-        batch.commit()?;
+        self.publish(&changes)?;
         self.object_count
             .fetch_add(pending.len() as u64, Ordering::Relaxed);
-        failpoint("after_index_commit")?;
-        self.db.persist(PersistMode::SyncAll)?;
         failpoint("after_index_sync")?;
         pending.clear();
         Ok(())
@@ -1062,19 +1199,25 @@ impl Store {
     pub fn exists(&self, hash: &[u8; 32]) -> Result<bool> {
         Ok(self.location(hash)?.is_some())
     }
-    fn acquire_file(&self, id: Uuid, path: &Path) -> Result<Arc<File>> {
+    fn acquire_file(&self, id: Uuid, path: &Path) -> Result<FileLease<'_>> {
         let mut cache = self.files.lock();
         loop {
             if let Some(n) = cache.entries.iter().position(|(key, _)| *key == id) {
                 let entry = cache.entries.remove(n).unwrap();
                 let file = entry.1.clone();
                 cache.entries.push_back(entry);
-                return Ok(file);
+                return Ok(FileLease {
+                    file: Some(file),
+                    available: &self.files_available,
+                });
             }
             if cache.entries.len() < cache.max {
                 let f = Arc::new(File::open(path)?);
                 cache.entries.push_back((id, f.clone()));
-                return Ok(f);
+                return Ok(FileLease {
+                    file: Some(f),
+                    available: &self.files_available,
+                });
             }
             if let Some(n) = cache
                 .entries
@@ -1085,11 +1228,18 @@ impl Store {
                 self.files_available.notify_all();
                 continue;
             }
-            self.files_available.wait(&mut cache);
+            self.files_available
+                .wait_for(&mut cache, Duration::from_millis(50));
         }
     }
     pub fn get(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        let Some(loc) = self.location(hash)? else {
+        let visible = self.visibility.read();
+        let Some(loc) = self
+            .objects
+            .get(hash)?
+            .map(|v| decode_loc(&v))
+            .transpose()?
+        else {
             return Ok(None);
         };
         let id = Uuid::from_bytes(loc.segment);
@@ -1110,6 +1260,7 @@ impl Store {
             "stored object exceeds configured read limit"
         );
         let file = self.acquire_file(id, &segment_path(&self.root, &m))?;
+        drop(visible);
         let result = (|| {
             let mut h = [0; 64];
             read_exact_at(&file, &mut h, loc.offset - 64)?;
@@ -1143,8 +1294,8 @@ impl Store {
             "segment page limit must be 1..1000"
         );
         let cursor = cursor.map(parse_segment_cursor).transpose()?;
+        let _visible = self.visibility.read();
         let metas = {
-            let _visible = self.visibility.read();
             if let Some(id) = cursor {
                 ensure!(
                     self.segments.contains_key(id.as_bytes())?,
@@ -1188,8 +1339,8 @@ impl Store {
     }
 
     pub fn segment_info(&self, id: Uuid) -> Result<Option<crate::inspection::SegmentInfo>> {
+        let _visible = self.visibility.read();
         let meta = {
-            let _visible = self.visibility.read();
             self.segments
                 .get(id.as_bytes())?
                 .map(|v| decode_meta(id, &v))
@@ -1219,8 +1370,8 @@ impl Store {
     }
 
     pub fn object_info(&self, hash: [u8; 32]) -> Result<crate::inspection::ObjectInfo> {
+        let _visible = self.visibility.read();
         let location = {
-            let _visible = self.visibility.read();
             self.objects
                 .get(hash)?
                 .map(|v| decode_loc(&v))
@@ -1302,8 +1453,8 @@ impl Store {
         };
         check()?;
         progress.store(0, Ordering::Release);
+        let lease_visibility = self.visibility.read();
         let meta = {
-            let _visible = self.visibility.read();
             let value = self
                 .segments
                 .get(id.as_bytes())?
@@ -1339,6 +1490,11 @@ impl Store {
                     .wait_for(&mut cache, Duration::from_millis(50));
             }
         };
+        let file = FileLease {
+            file: Some(file),
+            available: &self.files_available,
+        };
+        drop(lease_visibility);
         let result = (|| {
             let physical = file.metadata()?.len();
             ensure!(
@@ -1527,6 +1683,9 @@ fn read_exact_at(file: &File, mut out: &mut [u8], mut offset: u64) -> Result<()>
 pub fn verify(config: &Config) -> Result<serde_json::Value> {
     // Verify committed bytes under exclusive ownership, without truncating or adopting tails.
     ensure!(config.storage.root.is_dir(), "store does not exist");
+    if selected_activation(&config.storage.root)?.is_some_and(|a| a.version == 2) {
+        return maintenance::verify_v2(config);
+    }
     let store = Store::open_mode(config, false)?;
     let status = store.status()?;
     let mut orphaned = vec![];
@@ -1546,6 +1705,11 @@ pub fn rebuild(config: &Config, salvage: bool) -> Result<serde_json::Value> {
     config.validate()?;
     let root = &config.storage.root;
     let _lock = store_lock(root)?;
+    if let Some(a) = selected_activation(root)?
+        && a.version == 2
+    {
+        return maintenance::rebuild_v2(config, a);
+    }
     let files = segment_files(root)?;
     let generation = new_generation(root)?;
     let (db, objects, segments) = open_db(&generation, config)?;
@@ -1656,6 +1820,7 @@ pub fn import(config: &Config, source: &Path) -> Result<serde_json::Value> {
     } else {
         None
     };
+    let source_namespace = maintenance::ScratchNamespace::source(config, &source_root)?;
     let store = Store::open(config)?;
     let mut imported = 0;
     let mut duplicates = 0u64;
@@ -1668,11 +1833,29 @@ pub fn import(config: &Config, source: &Path) -> Result<serde_json::Value> {
         export_files(&source_root, 0)?
     };
     for p in source_files {
+        if let Some(namespace) = &source_namespace {
+            let id = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            if !id
+                .map(|id| namespace.contains_segment(id))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
         let Some(mut scanned) = scan_file(&p, &source_root, false, false)? else {
             skipped += 1;
             continue;
         };
         let id = scanned.meta.id;
+        if let Some(namespace) = &source_namespace
+            && !namespace.contains_segment(id)?
+        {
+            continue;
+        }
         if let Some(previous) = seen_ids.insert(id, p.clone()) {
             ensure!(
                 files_equal(&previous, &p)?,
@@ -1743,7 +1926,8 @@ pub fn import(config: &Config, source: &Path) -> Result<serde_json::Value> {
         let data_end = scanned.meta.end;
         let mut publish = |pending: &mut Vec<([u8; 32], Location)>| -> Result<()> {
             let _visible = store.visibility.write();
-            let mut batch = store.db.batch();
+            let mut changes = vec![];
+            let mut added = 0;
             let mut seen = HashSet::new();
             for (hash, l) in pending.iter() {
                 let existing = store
@@ -1755,21 +1939,31 @@ pub fn import(config: &Config, source: &Path) -> Result<serde_json::Value> {
                     // An idempotent retry encountered this segment's live record.
                     continue;
                 }
-                if existing.is_some() || !seen.insert(*hash) {
+                if existing.is_some() || store.tombstones.contains_key(hash)? || !seen.insert(*hash)
+                {
                     duplicates += 1;
                     redundant += l.length;
                 } else {
                     scanned.meta.live += l.length;
-                    batch.insert(&store.objects, hash, encode_loc(*l));
+                    changes.push(Mutation::Put {
+                        hash: *hash,
+                        location: encode_loc(*l),
+                    });
+                    added += 1;
                 }
             }
-            batch.insert(&store.segments, id.as_bytes(), encode_meta(&scanned.meta));
-            batch.commit()?;
-            store.db.persist(PersistMode::SyncAll)?;
+            changes.push(Mutation::segment(&scanned.meta));
+            store.publish(&changes)?;
+            store.object_count.fetch_add(added, Ordering::Relaxed);
             pending.clear();
             Ok(())
         };
         scan_prefix_visit(&mut file, id, data_end, false, &mut |hash, l| {
+            if let Some(namespace) = &source_namespace
+                && namespace.location(&hash)? != Some(l)
+            {
+                return Ok(());
+            }
             pending.push((hash, l));
             if pending.len() >= config.writes.batch_max_records {
                 publish(&mut pending)?;

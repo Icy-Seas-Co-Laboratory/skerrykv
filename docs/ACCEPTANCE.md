@@ -5,8 +5,8 @@ This matrix distinguishes implemented behavior from execution evidence. Local va
 | Area | Implementation | Evidence |
 |---|---|---|
 | Native executable | Single Rust package, `skerry` binary; locked dependency graph | Local debug/release builds, CLI integration tests |
-| Segments and Fjall | Versioned compact metadata, two keyspaces, no value separation; UUIDv4 files with checksummed headers and sealed footers | Golden format vectors, roundtrip, corruption, rotation, restart tests |
-| Durable acknowledgments | Segment sync → atomic cross-keyspace batch → index sync → success | Native subprocess termination and seven write-boundary abort tests |
+| Segments and Fjall | Versioned compact metadata, object/segment/tombstone/retired keyspaces in v2, no value separation; UUIDv4 files with checksummed headers and sealed footers | Golden format vectors, roundtrip, corruption, rotation, restart tests |
+| Durable acknowledgments | V2: segment sync → mutation frame sync → inactive witness sync → atomic cross-keyspace batch/index sync → success | Native subprocess termination and seven write-boundary abort tests |
 | Recovery | Indexed committed end, tail discard, interrupted seal reconciliation, fail-closed committed corruption | Truncation/header/payload/footer corruption, incomplete append, sealing abort tests |
 | Exclusive ownership | Same lock for service and offline maintenance | Concurrent open/maintenance refusal tests |
 | Reads and writes | Bounded writer batching, concurrent positional reads, duplicate suppression | Different/identical concurrent inserts, reads during ingestion, queue/cache tests |
@@ -16,7 +16,7 @@ This matrix distinguishes implemented behavior from execution evidence. Local va
 | HTTP | Versioned raw/binary endpoints, strict framing, per-item status, partial batch success | Router and actual TCP tests including duplex progression and stalled-upload drain |
 | Authentication | Token for non-loopback bind; configured token required except health; constant-time comparison | Non-loopback startup rejection, protected control routes, query-token rejection tests |
 | Graceful shutdown | Stop admission, bounded HTTP drain, force-close stalled sockets, drain/sync/seal writer, join readers | TCP drain, process exit, cancellation-resume/idempotence tests |
-| Rebuild | Fresh generations and checksummed activation; sealed-only default, explicit active salvage | Strict/salvage rebuild, corrupt activation, before/after activation abort tests |
+| Rebuild | Fresh generations and checksummed activation; v1 scan/salvage, v2 journal-authoritative committed namespace | Strict/salvage rebuild, corrupt activation, before/after activation abort tests |
 | Import | Copy/verify/sync/publish, bounded chunks, deterministic existing mapping wins, full UUID collision checks | Duplicate/import/idempotency/export/footer collision and interrupted-import tests |
 | CLI and dashboard | All operational commands, five monitoring panels, rates, errors/events, confirmed shutdown, attach/embedded modes | CLI tests; Unix pseudo-terminal attach/embedded detach/restoration tests; local development startup smoke |
 | Development scripts | POSIX shell and PowerShell; tool checks, default config, headless/TUI modes | Local POSIX startup/status/shutdown smoke, shell syntax check; PowerShell unexecuted locally |
@@ -28,13 +28,13 @@ This matrix distinguishes implemented behavior from execution evidence. Local va
 
 ## Limits and deferred optimizations
 
-- One storage volume and at most one active segment during salvage. Default rebuild may exclude acknowledged data from a lost active index; salvage is explicit because it may recover unacknowledged records.
+- One storage volume. Legacy v1 scan rebuild can exclude acknowledged active objects unless salvage is explicit. V2 rebuild uses the mutation journal and preserves committed active objects and deletion fences.
 - Ordered batch reads deliberately dispatch sequentially; completion-order reads have a bounded window. No separate reorder buffer is necessary.
 - HDD scheduling does not coalesce adjacent or nearby physical operations. Priorities are best effort with aging; they are not hard device-I/O deadlines. A coalesced request shares the priority of the original operation.
 - There is no automatic cache memory-pressure adaptation, speculative prefetch, or location cache. Fixed absolute budgets work in containers. General process memory includes additional index memtables, protocol buffers, metadata, and allocator overhead.
 - Metrics are logical operations/bytes and wall-clock timings, not physical storage-device I/O. Cache hits cannot establish physical disk reads avoided. Latency samples are bounded and session-scoped. CPU/RSS and reliably cold-cache measurements are reported unavailable.
 - Imports can become partially visible across bounded durable batches; interruption is safe to retry. Source stores must be offline; independent export bundles must remain immutable throughout copying.
-- Older index generations and unreferenced final segment files are retained. Startup cleans abandoned import staging files. Automatic garbage collection and deletion are absent.
+- V2 supports durable deletion, opt-in online GC and offline full vacuum. Startup retries known retired-file cleanup. Unknown unreferenced copies and old index generations are retained until explicit full vacuum. Online GC currently compacts a whole source at a time and skips sources whose live data exceed its pass budget; candidate header scanning is not bounded by that copy budget.
 - The TUI logs panel contains bounded coordinator events/errors. General tracing remains available in the service log output (embedded TUI directs it to a file).
 - Windows directory-entry power-loss behavior has not been validated. No process-kill test establishes safety against power loss, OS failure, lying drive caches, or unsupported network filesystem semantics. Use local filesystems with reliable locking/synchronization, backups, and appropriate hardware validation.
 
@@ -68,3 +68,14 @@ Validation on macOS ARM64:
 - A release executable smoke passed HTTP/stdio initialization/discovery, scoped durable PUT/deduplication, tool/binary-resource/native roundtrips, verification progress and shared result, actual MCP status, and graceful service shutdown.
 
 Windows/Linux process invocation uses native argument arrays and the existing CI jobs run these tests. They were not executed locally. Docker configuration now disables MCP by default and includes CMake for SDK TLS source builds; Docker execution still requires an available daemon. A production OAuth gateway is a documented integration contract, not a bundled or externally validated deployment. See [MCP deployment and limits](MCP.md).
+
+## V2 deletion and maintenance validation — 2026-10-27
+
+Version 0.2.0 was reviewed independently after implementation by bounded subagents. Review fixes covered source deletion import fences, cache/coalescing generations, reader/GC lock ordering, descriptor release, retirement cleanup after interruption, root-marker publication/recovery, acknowledged-journal truncation, and torn witness writes.
+
+- `cargo test --locked --all-targets`: 112 tests passed, zero failures. This includes legacy-v1 behavior, explicit upgrade, deletion/recreation, zero-byte objects, scheduled/manual GC, cancellation/shutdown capacity, dry-run file snapshots, full vacuum, deletion-preserving rebuild/import, and native crash-boundary tests.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo fmt --all --check`, and `git diff --check`: passed.
+- `cargo build --release --locked --bin skerry`: passed on macOS ARM64.
+- A real 0.1 executable created a disposable v1 store; 0.2 upgraded it, and 0.1 subsequently rejected it. Authorized/idempotent deletion, empty/live payloads, forced GC, dry-run immutability, vacuum, verification, rebuild, restart and re-PUT passed. See [smoke results](MAINTENANCE_SMOKE.json) and `scripts/smoke-maintenance.py`.
+- Docker/Compose/CI now use `skerry health` (HTTP `/v1/health`) rather than the informational status command. CLI tests verify nonzero exit for HTTP 503. Docker daemon was unavailable, so container runtime and native Linux/Windows execution remain unverified here.
+- [Small protocol comparison](V2_PROTOCOL_BENCHMARK.json) measures the stronger write protocol separately from the earlier v0.1 benchmarks. See [maintenance performance and limits](MAINTENANCE.md). No power-loss validation is claimed.

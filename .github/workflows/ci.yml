@@ -58,7 +58,7 @@ jobs:
           docker run -d --name skerry-smoke -p 127.0.0.1:7788:7788 \
             -e SKERRY_TOKEN=ci-test-token skerrykv:ci
           for attempt in $(seq 1 30); do
-            if docker exec skerry-smoke skerry status --url http://127.0.0.1:7788; then exit 0; fi
+            if docker exec skerry-smoke skerry health --url http://127.0.0.1:7788; then exit 0; fi
             sleep 1
           done
           docker logs skerry-smoke

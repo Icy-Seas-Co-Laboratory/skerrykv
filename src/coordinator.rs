@@ -1,7 +1,7 @@
 //! Bounded asynchronous coordination. All storage/index calls execute on blocking workers.
 use crate::{
     config::Config,
-    engine::{PutResult, StorageStatus, Store},
+    engine::{DeleteResult, PutResult, StorageStatus, Store},
 };
 use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
@@ -31,7 +31,8 @@ fn shared_error(error: String) -> anyhow::Error {
 
 type Hash = [u8; 32];
 type SharedResult = std::result::Result<Option<Bytes>, String>;
-type Waiters = Arc<Mutex<HashMap<Hash, Vec<oneshot::Sender<SharedResult>>>>>;
+type ReadKey = (Hash, u64);
+type Waiters = Arc<Mutex<HashMap<ReadKey, Vec<oneshot::Sender<SharedResult>>>>>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Priority {
@@ -63,6 +64,8 @@ pub struct Status {
     pub storage: StorageStatus,
     pub io: IoStatus,
     pub cache: CacheStatus,
+    #[serde(default)]
+    pub gc: GcStatus,
     pub errors: Vec<String>,
     pub policy: String,
     pub read_workers: usize,
@@ -72,6 +75,14 @@ pub struct Status {
     pub write_queue_capacity_bytes: usize,
     pub events: Vec<String>,
     pub mcp: crate::mcp::McpStatus,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub completed_runs: u64,
+    pub last_result: Option<serde_json::Value>,
+    pub last_error: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IoStatus {
@@ -348,6 +359,20 @@ impl PayloadCache {
         self.bytes = 0;
         self.protected_bytes = 0;
     }
+    fn invalidate(&mut self, hash: &Hash) {
+        if let Some(entry) = self.entries.remove(hash) {
+            self.bytes -= entry.bytes.len();
+            if entry.protected {
+                self.protected_bytes -= entry.bytes.len();
+                self.protected.remove(&entry.tick);
+            } else {
+                self.probation.remove(&entry.tick);
+            }
+        }
+        if let Some((_, tick)) = self.seen.remove(hash) {
+            self.seen_order.remove(&tick);
+        }
+    }
     fn maintain(&mut self) {
         while let Some((tick, hash)) = self.seen_order.first_key_value().map(|(k, v)| (*k, *v)) {
             if self
@@ -379,10 +404,16 @@ struct WriteRequest {
 }
 enum WriteMessage {
     Put(WriteRequest),
+    Delete {
+        hash: Hash,
+        response: oneshot::Sender<std::result::Result<DeleteResult, String>>,
+        _request: OwnedSemaphorePermit,
+    },
     Shutdown(oneshot::Sender<std::result::Result<(), String>>),
 }
 struct ReadRequest {
     hash: Hash,
+    epoch: u64,
     priority: Priority,
     submitted: Instant,
 }
@@ -404,6 +435,11 @@ pub struct Coordinator {
     requests: Arc<Semaphore>,
     waiters: Waiters,
     cache: Arc<Mutex<PayloadCache>>,
+    read_epoch: Arc<AtomicU64>,
+    gc_status: Arc<Mutex<GcStatus>>,
+    gc_gate: Arc<Semaphore>,
+    maintenance_stop: tokio_util::sync::CancellationToken,
+    gc_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     counters: Arc<Counters>,
     started: Instant,
     accepting: AtomicBool,
@@ -424,11 +460,14 @@ impl Coordinator {
         counters.event("store opened; durable write coordinator ready".into());
         let waiters = Arc::new(Mutex::new(HashMap::new()));
         let cache = Arc::new(Mutex::new(PayloadCache::new(&config)));
+        let read_epoch = Arc::new(AtomicU64::new(0));
         let write_handle = tokio::spawn(write_loop(
             store.clone(),
             write_rx,
             counters.clone(),
             config.clone(),
+            cache.clone(),
+            read_epoch.clone(),
         ));
         let read_stop = tokio_util::sync::CancellationToken::new();
         let read_budget = Arc::new(Semaphore::new(
@@ -444,6 +483,7 @@ impl Coordinator {
             ReadControl {
                 stop: read_stop.clone(),
                 budget: read_budget.clone(),
+                epoch: read_epoch.clone(),
             },
         ));
         let weak = Arc::downgrade(&cache);
@@ -455,7 +495,12 @@ impl Coordinator {
                 cache.lock().maintain();
             }
         });
-        Ok(Arc::new(Self {
+        let gc_status = Arc::new(Mutex::new(GcStatus {
+            enabled: config.gc.enabled,
+            ..GcStatus::default()
+        }));
+        let maintenance_stop = tokio_util::sync::CancellationToken::new();
+        let coordinator = Arc::new(Self {
             mcp: crate::mcp::Runtime::new(&config),
             read_budget,
             write_budget: Arc::new(Semaphore::new(config.writes.max_pending_mib * 1024 * 1024)),
@@ -466,6 +511,11 @@ impl Coordinator {
             read_tx,
             waiters,
             cache,
+            read_epoch,
+            gc_status,
+            gc_gate: Arc::new(Semaphore::new(1)),
+            maintenance_stop: maintenance_stop.clone(),
+            gc_handle: tokio::sync::Mutex::new(None),
             counters,
             started: Instant::now(),
             accepting: AtomicBool::new(true),
@@ -474,7 +524,31 @@ impl Coordinator {
             read_stop,
             read_handle: tokio::sync::Mutex::new(Some(read_handle)),
             write_handle: tokio::sync::Mutex::new(Some(write_handle)),
-        }))
+        });
+        if coordinator.config.gc.enabled {
+            let weak = Arc::downgrade(&coordinator);
+            let interval_seconds = coordinator.config.gc.interval_seconds;
+            let handle = tokio::spawn(async move {
+                let start = tokio::time::Instant::now() + Duration::from_secs(interval_seconds);
+                let mut interval =
+                    tokio::time::interval_at(start, Duration::from_secs(interval_seconds));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = maintenance_stop.cancelled() => break,
+                        _ = interval.tick() => {
+                            let Some(c) = weak.upgrade() else { break };
+                            if let Err(error) = c.collect_garbage(false).await {
+                                c.counters.error(format!("scheduled GC: {error:#}"));
+                            }
+                        }
+                    }
+                }
+            });
+            *coordinator.gc_handle.lock().await = Some(handle);
+        }
+        Ok(coordinator)
     }
     pub(crate) fn storage(&self) -> Arc<Store> {
         self.store.clone()
@@ -595,6 +669,98 @@ impl Coordinator {
         self.counters.latency(start);
         result
     }
+    pub async fn delete(&self, hash: Hash) -> Result<DeleteResult> {
+        let started = Instant::now();
+        let request = self.requests.clone().acquire_owned().await?;
+        let receiver = {
+            let _admission = self.admission.lock().await;
+            ensure!(
+                self.accepting.load(Ordering::Acquire),
+                "service shutting down"
+            );
+            ensure!(
+                !self.counters.faulted.load(Ordering::Acquire),
+                "writer faulted"
+            );
+            let slot = self
+                .write_tx
+                .reserve()
+                .await
+                .map_err(|_| anyhow!("writer stopped"))?;
+            let (tx, rx) = oneshot::channel();
+            self.counters.write_queue.fetch_add(1, Ordering::Relaxed);
+            slot.send(WriteMessage::Delete {
+                hash,
+                response: tx,
+                _request: request,
+            });
+            rx
+        };
+        let result = receiver
+            .await
+            .map_err(|_| anyhow!("writer stopped before deletion completed"))?
+            .map_err(anyhow::Error::msg);
+        self.counters.latency(started);
+        result
+    }
+    pub async fn collect_garbage(&self, force: bool) -> Result<serde_json::Value> {
+        let request = self.requests.clone().acquire_owned().await?;
+        let handle = {
+            let _admission = self.admission.lock().await;
+            ensure!(
+                self.accepting.load(Ordering::Acquire),
+                "service shutting down"
+            );
+            ensure!(
+                !self.counters.faulted.load(Ordering::Acquire),
+                "writer faulted"
+            );
+            let gate = self
+                .gc_gate
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| ResourceExhausted)?;
+            let store = self.store.clone();
+            let status = self.gc_status.clone();
+            let counters = self.counters.clone();
+            status.lock().running = true;
+            tokio::task::spawn_blocking(move || {
+                struct Run {
+                    status: Arc<Mutex<GcStatus>>,
+                    _request: OwnedSemaphorePermit,
+                    _gate: OwnedSemaphorePermit,
+                }
+                impl Drop for Run {
+                    fn drop(&mut self) {
+                        self.status.lock().running = false;
+                    }
+                }
+                let _run = Run {
+                    status: status.clone(),
+                    _request: request,
+                    _gate: gate,
+                };
+                let result = store.collect_garbage(force);
+                let mut state = status.lock();
+                state.completed_runs += 1;
+                match &result {
+                    Ok(value) => {
+                        state.last_result = Some(value.clone());
+                        state.last_error = None;
+                        counters.event("garbage collection pass completed".into());
+                    }
+                    Err(error) => {
+                        state.last_error = Some(format!("{error:#}"));
+                        if store.write_faulted() {
+                            counters.faulted.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                result
+            })
+        };
+        handle.await?
+    }
     pub async fn get(&self, hash: Hash) -> Result<Option<Bytes>> {
         self.get_priority(hash, Priority::Normal).await
     }
@@ -607,17 +773,22 @@ impl Coordinator {
             "service shutting down"
         );
         self.counters.reads.fetch_add(1, Ordering::Relaxed);
-        if let Some(bytes) = self.cache.lock().get(&hash) {
+        let (cached, epoch) = {
+            let mut cache = self.cache.lock();
+            (cache.get(&hash), self.read_epoch.load(Ordering::Acquire))
+        };
+        if let Some(bytes) = cached {
             self.counters
                 .read_bytes
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             self.counters.latency(start);
             return Ok(Some(bytes));
         }
+        let key = (hash, epoch);
         let rx = {
             let mut waiters = self.waiters.lock();
             let (tx, rx) = oneshot::channel();
-            if let Some(existing) = waiters.get_mut(&hash) {
+            if let Some(existing) = waiters.get_mut(&key) {
                 existing.retain(|sender| !sender.is_closed());
                 if existing.len() >= self.config.resources.max_requests {
                     return Err(ResourceExhausted.into());
@@ -625,18 +796,19 @@ impl Coordinator {
                 existing.push(tx);
                 self.counters.read_coalesced.fetch_add(1, Ordering::Relaxed);
             } else {
-                waiters.insert(hash, vec![tx]);
+                waiters.insert(key, vec![tx]);
                 self.counters.read_queue.fetch_add(1, Ordering::Relaxed);
                 if self
                     .read_tx
                     .try_send(ReadRequest {
                         hash,
+                        epoch,
                         priority,
                         submitted: start,
                     })
                     .is_err()
                 {
-                    waiters.remove(&hash);
+                    waiters.remove(&key);
                     self.counters.read_queue.fetch_sub(1, Ordering::Relaxed);
                     return Err(ResourceExhausted.into());
                 }
@@ -678,6 +850,7 @@ impl Coordinator {
             storage,
             io: self.counters.snapshot(),
             cache: self.cache.lock().status(),
+            gc: self.gc_status.lock().clone(),
             errors: self.counters.errors.lock().iter().cloned().collect(),
             policy: self.config.reads.policy.clone(),
             read_workers: self.config.reads.max_concurrency,
@@ -705,6 +878,10 @@ impl Coordinator {
             if matches!(*state, ShutdownState::Running) {
                 let _guard = self.admission.lock().await;
                 self.accepting.store(false, Ordering::Release);
+                self.maintenance_stop.cancel();
+                // Non-abortable compaction retains this gate until its last
+                // blocking operation finishes, including after caller cancellation.
+                let _gc_drained = self.gc_gate.clone().acquire_owned().await?;
                 self.counters
                     .event("shutdown requested; draining accepted operations".into());
                 let slot = self
@@ -728,6 +905,7 @@ impl Coordinator {
             }
         };
         self.mcp.cancel_jobs().await;
+        join_worker(&self.gc_handle).await?;
         self.read_stop.cancel();
         join_worker(&self.write_handle).await?;
         join_worker(&self.read_handle).await?;
@@ -808,11 +986,69 @@ async fn write_loop(
     mut rx: mpsc::Receiver<WriteMessage>,
     counters: Arc<Counters>,
     config: Config,
+    cache: Arc<Mutex<PayloadCache>>,
+    epoch: Arc<AtomicU64>,
 ) {
     let mut pending_shutdown = None;
-    while let Some(message) = rx.recv().await {
+    let mut deferred = None;
+    loop {
+        let message = match deferred.take() {
+            Some(message) => message,
+            None => match rx.recv().await {
+                Some(message) => message,
+                None => break,
+            },
+        };
         let first = match message {
             WriteMessage::Put(r) => r,
+            WriteMessage::Delete {
+                hash,
+                response,
+                _request,
+            } => {
+                let _request = _request;
+                counters.write_queue.fetch_sub(1, Ordering::Relaxed);
+                let db = store.clone();
+                let result = if counters.faulted.load(Ordering::Acquire) {
+                    Err(anyhow!("writer faulted"))
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        let result = db.delete(&hash);
+                        let faulted = db.write_faulted();
+                        (result, faulted)
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|(result, faulted)| {
+                        if faulted {
+                            counters.faulted.store(true, Ordering::Release);
+                        }
+                        result
+                    })
+                };
+                match result {
+                    Ok(result) => {
+                        // Complete the fence while holding the same cache lock
+                        // used by read completion; an old read cannot repopulate it.
+                        let mut cache = cache.lock();
+                        epoch.fetch_add(1, Ordering::AcqRel);
+                        cache.invalidate(&hash);
+                        drop(cache);
+                        counters.event(format!(
+                            "durable delete {} (existed={})",
+                            hex::encode(hash),
+                            result.deleted
+                        ));
+                        let _ = response.send(Ok(result));
+                    }
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        counters.error(error.clone());
+                        let _ = response.send(Err(error));
+                    }
+                }
+                continue;
+            }
             WriteMessage::Shutdown(done) => {
                 pending_shutdown = Some(done);
                 break;
@@ -826,6 +1062,10 @@ async fn write_loop(
                 Ok(Some(WriteMessage::Put(r))) => batch.push(r),
                 Ok(Some(WriteMessage::Shutdown(done))) => {
                     pending_shutdown = Some(done);
+                    break;
+                }
+                Ok(Some(message @ WriteMessage::Delete { .. })) => {
+                    deferred = Some(message);
                     break;
                 }
                 _ => break,
@@ -909,6 +1149,7 @@ async fn write_loop(
 struct ReadControl {
     stop: tokio_util::sync::CancellationToken,
     budget: Arc<Semaphore>,
+    epoch: Arc<AtomicU64>,
 }
 
 async fn read_loop(
@@ -920,7 +1161,11 @@ async fn read_loop(
     config: Config,
     control: ReadControl,
 ) {
-    let ReadControl { stop, budget } = control;
+    let ReadControl {
+        stop,
+        budget,
+        epoch,
+    } = control;
     let workers = Arc::new(Semaphore::new(config.reads.max_concurrency));
 
     loop {
@@ -993,7 +1238,7 @@ async fn read_loop(
             if length > config.max_object_bytes() as u64 {
                 complete(
                     &waiters,
-                    request.hash,
+                    (request.hash, request.epoch),
                     Err("stored object exceeds configured maximum".into()),
                 );
                 continue;
@@ -1003,7 +1248,7 @@ async fn read_loop(
                 Err(_) => {
                     complete(
                         &waiters,
-                        request.hash,
+                        (request.hash, request.epoch),
                         Err("read buffer capacity exhausted; retry later".into()),
                     );
                     continue;
@@ -1022,6 +1267,7 @@ async fn read_loop(
             let waiters = waiters.clone();
             let cache = cache.clone();
             let counters = counters.clone();
+            let epoch = epoch.clone();
             tokio::spawn(async move {
                 let _worker = worker;
                 let hash = request.hash;
@@ -1046,13 +1292,16 @@ async fn read_loop(
                     })
                 });
                 if let Ok(Some(bytes)) = &result {
-                    cache.lock().observe(hash, bytes);
+                    let mut cache = cache.lock();
+                    if epoch.load(Ordering::Acquire) == request.epoch {
+                        cache.observe(hash, bytes);
+                    }
                 }
                 if let Err(e) = &result {
                     counters.error(e.clone());
                 }
                 counters.inflight_reads.fetch_sub(1, Ordering::Relaxed);
-                complete(&waiters, hash, result);
+                complete(&waiters, (hash, request.epoch), result);
             });
         }
     }
@@ -1061,8 +1310,8 @@ async fn read_loop(
         .acquire_many(config.reads.max_concurrency as u32)
         .await;
 }
-fn complete(waiters: &Waiters, hash: Hash, result: SharedResult) {
-    if let Some(senders) = waiters.lock().remove(&hash) {
+fn complete(waiters: &Waiters, key: ReadKey, result: SharedResult) {
+    if let Some(senders) = waiters.lock().remove(&key) {
         for tx in senders {
             let _ = tx.send(result.clone());
         }
@@ -1100,6 +1349,105 @@ mod tests {
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    #[tokio::test]
+    async fn scheduled_collection_reclaims_and_shutdown_releases_store() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        config.gc.enabled = true;
+        config.gc.interval_seconds = 1;
+        config.gc.delete_grace_seconds = 0;
+        config.gc.cooldown_seconds = 0;
+        config.gc.min_free_mib = 0;
+        {
+            let store = Store::open(&config).unwrap();
+            let results = store
+                .put_many(&[Bytes::from(vec![8; 65536]), Bytes::new()])
+                .unwrap();
+            store.seal().unwrap();
+            store.delete(&results[0].hash).unwrap();
+        }
+        let c = Coordinator::open(config.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if c.gc_status.lock().completed_runs > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(c.gc_status.lock().last_error.is_none());
+        assert_eq!(
+            c.gc_status.lock().last_result.as_ref().unwrap()["retired_segments"],
+            1
+        );
+        c.shutdown().await.unwrap();
+        drop(c);
+        let store = Store::open(&config).unwrap();
+        assert_eq!(store.status().unwrap().objects, 1);
+        assert!(store.exists(blake3::hash(b"").as_bytes()).unwrap());
+    }
+    #[test]
+    fn cancelled_gc_retains_admission_and_shutdown_waits_for_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.storage.root = root.path().into();
+            let c = Coordinator::open(config).await.unwrap();
+            let (started_tx, started_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let gc = {
+                let c = c.clone();
+                tokio::spawn(async move { c.collect_garbage(true).await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while c.gc_gate.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            gc.abort();
+            let _ = gc.await;
+            assert!(c.gc_status.lock().running);
+            assert_eq!(
+                c.requests.available_permits(),
+                c.config.resources.max_requests - 1
+            );
+            let shutdown = {
+                let c = c.clone();
+                tokio::spawn(async move { c.shutdown().await })
+            };
+            tokio::task::yield_now().await;
+            assert!(!shutdown.is_finished());
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!c.gc_status.lock().running);
+            assert_eq!(c.gc_gate.available_permits(), 1);
+            assert_eq!(
+                c.requests.available_permits(),
+                c.config.resources.max_requests
+            );
+        });
+    }
     #[test]
     fn cancelled_duplicate_probe_retains_byte_and_request_capacity() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1203,7 +1551,7 @@ mod cancellation_tests {
         assert!(
             c.waiters
                 .lock()
-                .get(&hash)
+                .get(&(hash, c.read_epoch.load(Ordering::Acquire)))
                 .is_some_and(|waiters| waiters.len() <= 1)
         );
         c.shutdown().await.unwrap();

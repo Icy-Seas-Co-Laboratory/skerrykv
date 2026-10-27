@@ -15,6 +15,7 @@ regardless of host port publication.
   Successful responses mean durable completion, including duplicate requests.
 - `GET /objects/{hash}`: raw `application/octet-stream` bytes or HTTP 404.
 - `HEAD /objects/{hash}`: HTTP 200 if indexed, otherwise 404; no payload read.
+- `DELETE /objects/{hash}`: idempotent HTTP 204, including for an absent hash. Requires an explicitly configured `SKERRY_TOKEN` service administrator credential, even on loopback; MCP scoped credentials cannot authorize it. A v1 store returns HTTP 409 with offline upgrade instructions.
 - Successful object responses include `X-Skerry-Hash` with the canonical digest.
 - `GET /health`: JSON health/version; unhealthy states return HTTP 503.
 - `GET /status`: measured storage, I/O, cache, service status.
@@ -22,6 +23,7 @@ regardless of host port publication.
 - `GET /cache/stats`: measured payload cache counters.
 - `POST /admin/cache-clear`: evict resident cache entries; active responses may
   still hold shared buffers. Returns `{ "cleared": true }`.
+- `POST /admin/gc?force=true`: run a collection pass; `force` defaults to false. Requires an explicitly configured service administrator credential. A v1 store returns HTTP 409 with offline upgrade instructions.
 - `POST /admin/shutdown`: HTTP 202; stops new admission and drains accepted work.
 
 Malformed hashes return 400, wrong upload media types 415, oversized single

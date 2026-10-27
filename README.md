@@ -35,13 +35,14 @@ cargo build --release --locked
 On Windows use `.\target\release\skerry.exe`. Native deployments run in the foreground; use your operating system's service manager if needed. CI builds archives for Windows x86-64, Linux x86-64, and Linux ARM64, including the executable and example configuration.
 
 ```sh
+skerry health
 skerry status
 skerry tui --connect http://127.0.0.1:7788
 skerry stop
 skerry --help
 ```
 
-`status`, `stop`, and cache commands accept `--url`. Set `SKERRY_TOKEN` in the client environment when authentication is enabled. Use `Ctrl+C` or SIGTERM to drain and persist the service. A second writable or maintenance process fails on the exclusive store lock.
+`health`, `status`, `stop`, and cache commands accept `--url`. `health` exits unsuccessfully when the service reports an unhealthy status. Set `SKERRY_TOKEN` in the client environment when authentication is enabled. Use `Ctrl+C` or SIGTERM to drain and persist the service. A second writable or maintenance process fails on the exclusive store lock.
 
 ## Docker
 
@@ -81,10 +82,12 @@ When configured, add `-H "Authorization: Bearer $SKERRY_TOKEN"`. All endpoints e
 | GET | `/v1/metrics` | Prometheus text exposition |
 | PUT | `/v1/objects` | Raw upload; JSON canonical hash and duplicate flag |
 | GET / HEAD | `/v1/objects/{hash}` | Raw bytes / existence |
+| DELETE | `/v1/objects/{hash}` | Delete by hash; service administrator credential required; idempotent 204 |
 | POST | `/v1/objects/batch-put` | Streaming binary per-item results |
 | POST | `/v1/objects/batch-get` | Streaming binary payloads and statuses |
 | GET | `/v1/cache/stats` | Cache counters |
 | POST | `/v1/admin/cache-clear` | Evict resident payload cache |
+| POST | `/v1/admin/gc` | Run a collection pass; service administrator credential required |
 | POST | `/v1/admin/shutdown` | Begin graceful shutdown |
 
 GET supports `?priority=interactive`, `normal`, or `bulk`. Batch GET defaults to input order; `?ordered=false` permits completion order. The [binary protocol specification](docs/PROTOCOL.md) includes layouts and failure semantics. Batch PUT allows partial success; previously committed items survive a malformed suffix. Clients must consume responses while streaming large requests to avoid transport backpressure deadlocks.
@@ -151,9 +154,25 @@ skerry import-segments --source ./other-archive --path ./archive
 
 Normal startup verifies committed data and index references, discards uncommitted active tails, and reconciles interrupted seals. Committed corruption or a missing referenced file fails closed. Synchronization failures fault the writer; restart/recovery is required before further writes. Existing validated reads may continue.
 
-A default disaster rebuild includes validated sealed segments and excludes active files. This can exclude acknowledged objects from the last active segment if the index has been lost. `--salvage` explicitly permits recovering valid active records that might never have been acknowledged. Neither mode reconstructs client acknowledgment history. The old index generation remains available; checksummed activation records select the latest generation. Invalid newest activation records do not silently fall back to a stale generation.
+For legacy v1 stores, a default disaster rebuild includes validated sealed segments and excludes active files; `--salvage` additionally permits recovery of verified active prefixes, including potentially unacknowledged records. For v2 stores, rebuild replays the selected mutation journal, preserving committed active objects and deletion history. Neither format reconstructs client acknowledgment history. The old index generation remains available; checksummed activation records select the latest generation. Invalid newest activation records do not silently fall back to a stale generation.
 
-Import copies sealed segments while both stores are offline. It verifies staged bytes, synchronizes the destination, then publishes index mappings. Existing object mappings win; redundant retained physical payloads are reported. A conflicting UUID is an error. The source remains unchanged. No deletion or garbage collection is implemented; unreferenced archival files are reported for explicit maintenance.
+Import copies sealed segments while both stores are offline. It verifies staged bytes, synchronizes the destination, then publishes index mappings. Existing object mappings win; redundant retained physical payloads are reported. A conflicting UUID is an error. The source remains unchanged. V2 import honors source live mappings and destination deletion fences. Unknown unreferenced files are retained for inspection or explicit full vacuum; known retired segments are cleaned automatically.
+
+## Deletion and maintenance
+
+`skerry delete <hash>` deletes through the running service using `SKERRY_TOKEN`;
+pass `--connect` for another service. The DELETE endpoint requires a configured
+service administrator token even on loopback. Repeating a delete is safe; it
+returns HTTP 204 whether the object existed or was already absent. MCP has no
+delete tool, and scoped MCP credentials cannot call the native delete route.
+
+Run an online collection pass with `skerry gc` (or `skerry gc --force`) using
+the service administrator credential. Use `skerry upgrade --path ./data` and `skerry vacuum --path ./data` with the
+service stopped. New stores use v2; existing v1 stores need explicit upgrade,
+and older binaries reject v2 stores. `skerry vacuum --path ./data --dry-run` reports the planned
+work. These commands require exclusive access to the store. Deletion changes
+logical visibility; physical reclamation is not secure erasure. See
+[maintenance](docs/MAINTENANCE.md) for operating details and GC settings.
 
 ## Model Context Protocol (MCP)
 

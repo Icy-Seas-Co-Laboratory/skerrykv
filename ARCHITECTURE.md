@@ -4,13 +4,13 @@ SkerryKV is one Rust package with an independent synchronous storage engine and 
 
 ## Authority and data flow
 
-Payload bytes in segments are authoritative for object contents. During normal operation the selected Fjall generation is authoritative for committed locations and logical ends. A structurally valid record beyond the indexed committed end is uncommitted. A durable commit can exist without its acknowledgment reaching a client.
+Payload bytes in segments are authoritative for object contents. In v2 the selected durable mutation journal is authoritative for namespace membership, committed locations, and logical ends; Fjall is a replayable index. In v1 the selected Fjall generation is authoritative. A structurally valid record beyond the indexed committed end is uncommitted. A durable commit can exist without its acknowledgment reaching a client.
 
-PUT admission bounds the object and outstanding bytes. A single coordinator groups up to 512 calls over at most 10 ms. The engine hashes, checks persistent and same-batch duplicates, appends unique records, synchronizes segment bytes, atomically publishes object locations and segment metadata across two Fjall keyspaces, then calls `Database::persist(SyncAll)`. Successful waiters receive the canonical digest. Rotation commits the current group before sealing its segment and continuing in a new one. Batch PUT is partial-success transport, not a transaction.
+PUT admission bounds the object and outstanding bytes. A single coordinator groups up to 512 calls over a configurable delay, default 1 ms. The engine hashes, checks persistent and same-batch duplicates, appends unique records, synchronizes segment bytes, synchronizes the v2 mutation journal, atomically publishes object locations and segment metadata in Fjall, then calls `Database::persist(SyncAll)`. Successful waiters receive the canonical digest. Rotation commits the current group before sealing its segment and continuing in a new one. Batch PUT is partial-success transport, not a transaction.
 
 The writer mutex serializes storage mutation. A publication visibility lock protects index commit and persistence, so ordinary readers do not see the intermediate publication phase. This lock is not held during payload reads or append I/O. On ambiguous failure the writer faults and further writes fail; valid but unacknowledged records whose index commit already occurred may remain readable. Segment synchronization precedes index publication, so those reads still validate actual bytes.
 
-GET checks the payload cache, coalesces pending identical hashes, resolves metadata on a blocking worker, and enqueues bounded positional reads. Every disk-read payload is BLAKE3 verified. Cache hits reuse previously verified immutable buffers. No hash mismatch is returned as successful data. HEAD checks existence in the index and does not read/hash payload contents.
+GET checks the payload cache, coalesces pending identical hashes, resolves metadata on a blocking worker, and enqueues bounded positional reads. Every disk-read payload is BLAKE3 verified. Cache hits reuse previously verified immutable buffers. A committed delete invalidates its cache entry and advances a read epoch, preventing older in-flight reads from repopulating the cache or coalescing with later reads. No hash mismatch is returned as successful data. HEAD checks existence in the index and does not read/hash payload contents.
 
 ## Store layout and index schema
 
@@ -18,6 +18,8 @@ GET checks the payload cache, coalesces pending identical hashes, resolves metad
 store/
   config.toml                 # created by init; service may use an external config
   store.lock                  # exclusive ownership, never removed to steal a lock
+  format-v2                   # checksummed v2 activation backup
+  journal-<uuid>.log          # v2 committed mutation authority
   index/
     generation-<uuid>/        # Fjall files
     activation-<sequence>.json # checksummed immutable activation records
@@ -40,7 +42,7 @@ Sealing requires all records to be committed. The writer truncates unused logica
 |---|---|
 | Partial append or fully written unindexed record | Validate committed prefix, truncate active tail |
 | Segment synchronized before index commit | Same; never promote the tail in normal recovery |
-| Index commit before journal synchronization | Recover whichever atomic batch Fjall retained; payload was synchronized first |
+| Journal synchronized before index publication | Replay the committed v2 batch; payload was synchronized first |
 | Durable commit before response | Object may exist; retry deduplicates |
 | Partial seal footer | Truncate to indexed committed end and resume |
 | Valid synchronized footer, index still active | Validate identity/count/end/digest against metadata, finish sealing |
@@ -50,19 +52,19 @@ Fault injection covers record header/payload writes, segment synchronization, in
 
 ## Index rebuilding and import
 
-Offline commands acquire the same exclusive store lock. Rebuild scans without depending on old object mappings, constructs a fresh generation, persists it, closes its handles, and activates it via a new checksummed immutable control record. Unix directory synchronization orders publication. Older generations/control records remain retained for operator recovery. The highest activation sequence is authoritative; malformed newest activation is an explicit error, avoiding silent rollback to an index that predates later writes. This is not a directory replacement scheme and does not require renaming an open Fjall directory.
+Offline commands acquire the same exclusive store lock. Rebuild scans without depending on old object mappings, constructs a fresh generation, persists it, closes its handles, and activates it via a new checksummed immutable control record. Unix directory synchronization orders publication. Older generations/control records can be retained for operator recovery; offline vacuum removes obsolete generations after activation. The highest activation sequence is authoritative; malformed newest activation is an explicit error, avoiding silent rollback to an index that predates later writes. This is not a directory replacement scheme and does not require renaming an open Fjall directory.
 
-Default rebuilding includes sealed files only. Active records require explicit salvage and can include unacknowledged writes. Deterministic deduplication follows sorted relative segment paths and increasing record offsets. UUID collisions and validated-record corruption are errors. There is no way to recover exact client acknowledgment history from segment contents.
+V2 rebuilding replays its committed journal and validates referenced segments, including active committed records. V1 default rebuilding includes sealed files only; v1 active records require explicit salvage and can include unacknowledged writes. Deterministic deduplication follows sorted relative segment paths and increasing record offsets. UUID collisions and validated-record corruption are errors. There is no way to recover exact client acknowledgment history from segment contents.
 
-Import locks the source and destination, verifies sealed input, copies into staging, verifies destination bytes independently, synchronizes and publishes the destination file, then commits object/segment metadata. Existing mappings win. A crash can leave unreferenced bytes; retry verifies them before reuse. Same UUID with different complete bytes is rejected. Redundant payload bytes remain until an explicit future garbage-collection feature.
+Import locks the source and destination, verifies sealed input, copies into staging, verifies destination bytes independently, synchronizes and publishes the destination file, then commits object/segment metadata. Existing mappings win. A crash can leave unreferenced bytes; retry verifies them before reuse. Same UUID with different complete bytes is rejected. Deletion and deduplication can leave obsolete physical bytes. Bounded online GC copies live records from sealed segments, commits relocations only if the source location still matches, retires the source, and waits for active file leases before unlinking. Offline vacuum rewrites the live namespace and activates a fresh journal and index. Reclamation is not secure erasure.
 
 ## Bounds and scheduling
 
-HTTP admissions last through response-body lifetime. Uploads reserve a maximum-object ingress allowance before reading. Coordinator writes separately retain byte permits until completion. Read allocations retain permits through every reference, including network responses. Cache allocations have an independent semaphore; eviction does not release a pinned allocation prematurely. Admission metadata, queues, worker count, descriptor cache, and batch item count are separately bounded.
+HTTP admissions last through response-body lifetime. Uploads reserve the declared size before reading, or the maximum-object allowance when no length is supplied. Coordinator writes separately retain byte permits until completion. Read allocations retain permits through every reference, including network responses. Cache allocations have an independent semaphore; eviction does not release a pinned allocation prematurely. Admission metadata, queues, worker count, descriptor cache, and batch item count are separately bounded.
 
 The cache has probation and protected LRU segments with an 80% protected target. A bounded, expiring second-hit tracker reduces one-time scan pollution. The cache has no content expiration, warming, or automatic pressure detector. Thirty-second maintenance expires admission history. Memory accounting covers payload allocations, not a promised process RSS ceiling.
 
-SSD scheduling adds no accumulation sleep. HDD scheduling accumulates a short configurable window, groups by segment and offset within priority classes, and promotes requests older than 100 ms. The scheduling window does not impose a hard device-I/O deadline. A single dispatch window is at most 512 operations. Positional APIs are Unix `read_at` and Windows `seek_read`; no direct I/O, io_uring, or unsafe Rust is required. Reader handles use a bounded cache and active leases prevent eviction of in-use files. Reader/writer handles are not renamed or deleted during ordinary operation.
+SSD scheduling adds no accumulation sleep. HDD scheduling accumulates a short configurable window, groups by segment and offset within priority classes, and promotes requests older than 100 ms. The scheduling window does not impose a hard device-I/O deadline. A single dispatch window is at most 512 operations. Positional APIs are Unix `read_at` and Windows `seek_read`; no direct I/O, io_uring, or unsafe Rust is required. Reader handles use a bounded cache and active leases prevent eviction of in-use files. Active reader leases protect sealed segment handles during collection.
 
 Ordered batch GET dispatches one item at a time. Completion mode has a bounded window and polls input and completed results concurrently. A full retained-read budget returns a retryable resource error, so clients cannot deadlock the server by collecting more result buffers than capacity. Large clients should consume and release results incrementally.
 
@@ -70,7 +72,7 @@ Ordered batch GET dispatches one item at a time. Completion mode has a bounded w
 
 Cancellation stops HTTP admission, drains accepted HTTP work for a bounded interval, then drains the accepted write queue, seals, and persists. Final persistence failure produces a nonzero service result. Forced termination cannot turn a failed operation into a successful acknowledgment. Signals are native Ctrl+C and Unix SIGTERM; the TUI is optional and detachment leaves the foreground service running.
 
-Counters represent logical application requests/bytes. Cache hits do not establish physical disk reads avoided, since the OS page cache may already have served a miss. Latency percentiles use the most recent 4,096 completed coordinator GET/PUT calls; cumulative storage/queue timings are wall-clock logical-operation measurements. Errors are retained in a bounded list; tokens are never part of status. General events use tracing on stderr/stdout. The process has no physical disk, CPU, or RSS measurement claim.
+Counters represent logical application requests/bytes. Cache hits do not establish physical disk reads avoided, since the OS page cache may already have served a miss. Latency percentiles use the most recent 4,096 completed coordinator GET/PUT calls; cumulative storage/queue timings are wall-clock logical-operation measurements. Errors are retained in a bounded list; tokens are never part of status. General events use tracing on stderr/stdout. GC status reports whether a pass is running and its latest result or error. The process has no physical disk, CPU, or RSS measurement claim.
 
 
 ## MCP adapter

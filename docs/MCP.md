@@ -72,7 +72,7 @@ MCP is read-only by default. With no credentials, anonymous loopback access has 
 | `SKERRY_MCP_MAINTENANCE_TOKEN` | Read + verification; verification additionally requires `allow_verification=true` |
 | `SKERRY_MCP_GATEWAY_TOKEN` | Trusted gateway-to-backend credential; not a public end-user credential |
 
-Different scopes must use distinct nonempty credentials. Scope headers from ordinary clients are ignored. Scoped credentials cannot stop the service, clear caches, rebuild indexes, or retrieve the native administrator status/log output. Native write scope permits raw uploads; `mcp.read_only` controls MCP tool writes specifically. Retain a separate `SKERRY_TOKEN` if using native administrative commands. Credentials are compared without content-dependent comparisons, never accepted in URLs, and never returned by tools.
+Different scopes must use distinct nonempty credentials. Scope headers from ordinary clients are ignored. Scoped credentials cannot delete objects, stop the service, clear caches, rebuild indexes, or retrieve the native administrator status/log output. No MCP delete tool is provided. Native write scope permits raw uploads; `mcp.read_only` controls MCP tool writes specifically. Retain a separate `SKERRY_TOKEN` if using native administrative commands. Credentials are compared without content-dependent comparisons, never accepted in URLs, and never returned by tools.
 
 For an explicitly writable local service:
 

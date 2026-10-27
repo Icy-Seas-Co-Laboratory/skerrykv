@@ -35,6 +35,19 @@ index_mib = 128
 admission_entries = 65536
 admission_window_seconds = 300
 
+# Initial tunable maintenance defaults; automatic collection is opt-in.
+[gc]
+enabled = false
+interval_seconds = 1800
+min_garbage_ratio = 0.5
+delete_grace_seconds = 86400
+cooldown_seconds = 86400
+max_copy_mib = 1024
+max_bytes_per_second_mib = 25
+low_space_percent = 20
+target_free_percent = 30
+min_free_mib = 256
+
 [logging]
 level = "info" # RUST_LOG overrides this
 

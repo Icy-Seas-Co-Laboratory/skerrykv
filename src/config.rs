@@ -18,6 +18,7 @@ pub struct Config {
     pub cache: Cache,
     pub logging: Logging,
     pub mcp: Mcp,
+    pub gc: Gc,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -143,6 +144,65 @@ impl Default for Logging {
         Self {
             level: "info".into(),
         }
+    }
+}
+
+/// Conservative, tunable maintenance defaults; automatic collection is opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Gc {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub min_garbage_ratio: f64,
+    pub delete_grace_seconds: u64,
+    pub cooldown_seconds: u64,
+    pub max_copy_mib: u64,
+    pub max_bytes_per_second_mib: u64,
+    pub low_space_percent: u64,
+    pub target_free_percent: u64,
+    pub min_free_mib: u64,
+}
+impl Default for Gc {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: 1800,
+            min_garbage_ratio: 0.5,
+            delete_grace_seconds: 86400,
+            cooldown_seconds: 86400,
+            max_copy_mib: 1024,
+            max_bytes_per_second_mib: 25,
+            low_space_percent: 20,
+            target_free_percent: 30,
+            min_free_mib: 256,
+        }
+    }
+}
+impl Gc {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.min_garbage_ratio.is_finite() && (0.0..=1.0).contains(&self.min_garbage_ratio),
+            "gc.min_garbage_ratio must be finite and in 0..=1"
+        );
+        ensure!(
+            self.interval_seconds > 0 && self.max_copy_mib > 0 && self.max_bytes_per_second_mib > 0,
+            "gc interval, copy budget and rate must be positive"
+        );
+        ensure!(
+            self.low_space_percent < self.target_free_percent && self.target_free_percent <= 100,
+            "gc free-space percentages must satisfy low < target <= 100"
+        );
+        for mib in [
+            self.max_copy_mib,
+            self.max_bytes_per_second_mib,
+            self.min_free_mib,
+        ] {
+            ensure!(
+                mib.checked_mul(1024 * 1024).is_some(),
+                "gc MiB value overflows bytes"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -416,6 +476,7 @@ impl Config {
             "timeouts must be positive"
         );
         self.mcp.validate(self.max_object_bytes())?;
+        self.gc.validate()?;
         Ok(())
     }
 }
@@ -423,6 +484,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gc_defaults_and_validation() {
+        let parsed: Config = toml::from_str("[storage]\nroot='data'").unwrap();
+        assert!(!parsed.gc.enabled);
+        assert_eq!(parsed.gc.interval_seconds, 1800);
+        let mut c = Config::default();
+        c.gc.min_garbage_ratio = f64::NAN;
+        assert!(c.validate().is_err());
+        c.gc.min_garbage_ratio = 0.5;
+        c.gc.low_space_percent = c.gc.target_free_percent;
+        assert!(c.validate().is_err());
+        c.gc.low_space_percent = 20;
+        c.gc.max_copy_mib = u64::MAX;
+        assert!(c.validate().is_err());
+    }
     #[test]
     fn config_roundtrip_and_limits() {
         let dir = tempfile::tempdir().unwrap();

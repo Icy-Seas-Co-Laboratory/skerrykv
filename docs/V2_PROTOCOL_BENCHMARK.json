@@ -1,0 +1,266 @@
+{
+  "records": 128,
+  "payload_bytes": 20480,
+  "trials": 3,
+  "binary_sha256": {
+    "before": "3f6a882cd858a2e170372b71a9df94d1d1a7f2b613083063a6ff46a7a8fd8e46",
+    "after": "b45168214df5a2a6900314b473b899cabcddf1aacf76c4158471531494837a95"
+  },
+  "scope": "Small warm-cache loopback HTTP comparison; sequential randomized case order; identical fixtures; GC disabled; default 1ms batching for both; not the full original benchmark matrix.",
+  "results": [
+    {
+      "binary": "/Users/tbkelly/Documents/GitHub/skerrykv/target/release/skerry",
+      "trial": 1,
+      "phases": [
+        {
+          "phase": "single_write",
+          "operations": 128,
+          "seconds": 2.8932460830546916,
+          "ops_per_second": 44.24096545042497
+        },
+        {
+          "phase": "duplicate_write",
+          "operations": 128,
+          "seconds": 0.03718250012025237,
+          "ops_per_second": 3442.4796499975437
+        },
+        {
+          "phase": "random_read",
+          "operations": 128,
+          "seconds": 0.014803541824221611,
+          "ops_per_second": 8646.579414567257
+        },
+        {
+          "phase": "batch64_write",
+          "operations": 128,
+          "seconds": 0.04159245896153152,
+          "ops_per_second": 3077.480947168476
+        },
+        {
+          "phase": "mixed_25_percent_write",
+          "operations": 128,
+          "seconds": 0.12557495781220496,
+          "ops_per_second": 1019.311511069123
+        }
+      ],
+      "profile": "after"
+    },
+    {
+      "binary": "/Users/tbkelly/Documents/GitHub/skerrykv/target/release/skerry-v0.1.0",
+      "trial": 1,
+      "phases": [
+        {
+          "phase": "single_write",
+          "operations": 128,
+          "seconds": 1.6247509999666363,
+          "ops_per_second": 78.78130249042988
+        },
+        {
+          "phase": "duplicate_write",
+          "operations": 128,
+          "seconds": 0.02427195804193616,
+          "ops_per_second": 5273.5753654009495
+        },
+        {
+          "phase": "random_read",
+          "operations": 128,
+          "seconds": 0.014210833003744483,
+          "ops_per_second": 9007.213016033096
+        },
+        {
+          "phase": "batch64_write",
+          "operations": 128,
+          "seconds": 0.025437917094677687,
+          "ops_per_second": 5031.858525349983
+        },
+        {
+          "phase": "mixed_25_percent_write",
+          "operations": 128,
+          "seconds": 0.08021141705103219,
+          "ops_per_second": 1595.7828038191087
+        }
+      ],
+      "profile": "before"
+    },
+    {
+      "binary": "/Users/tbkelly/Documents/GitHub/skerrykv/target/release/skerry-v0.1.0",
+      "trial": 2,
+      "phases": [
+        {
+          "phase": "single_write",
+          "operations": 128,
+          "seconds": 1.6245004169177264,
+          "ops_per_second": 78.79345469351308
+        },
+        {
+          "phase": "duplicate_write",
+          "operations": 128,
+          "seconds": 0.024256333941593766,
+          "ops_per_second": 5276.972204794347
+        },
+        {
+          "phase": "random_read",
+          "operations": 128,
+          "seconds": 0.016367374919354916,
+          "ops_per_second": 7820.435508484389
+        },
+        {
+          "phase": "batch64_write",
+          "operations": 128,
+          "seconds": 0.025257332948967814,
+          "ops_per_second": 5067.835161322168
+        },
+        {
+          "phase": "mixed_25_percent_write",
+          "operations": 128,
+          "seconds": 0.06790979206562042,
+          "ops_per_second": 1884.8533636550546
+        }
+      ],
+      "profile": "before"
+    },
+    {
+      "binary": "/Users/tbkelly/Documents/GitHub/skerrykv/target/release/skerry",
+      "trial": 2,
+      "phases": [
+        {
+          "phase": "single_write",
+          "operations": 128,
+          "seconds": 2.7360153750050813,
+          "ops_per_second": 46.78336283097908
+        },
+        {
+          "phase": "duplicate_write",
+          "operations": 128,
+          "seconds": 0.029895000159740448,
+          "ops_per_second": 4281.652427364005
+        },
+        {
+          "phase": "random_read",
+          "operations": 128,
+          "seconds": 0.01325750001706183,
+          "ops_per_second": 9654.912301359196
+        },
+        {
+          "phase": "batch64_write",
+          "operations": 128,
+          "seconds": 0.04320204094983637,
+          "ops_per_second": 2962.8229867340283
+        },
+        {
+          "phase": "mixed_25_percent_write",
+          "operations": 128,
+          "seconds": 0.13992133387364447,
+          "ops_per_second": 914.7997410858733
+        }
+      ],
+      "profile": "after"
+    },
+    {
+      "binary": "/Users/tbkelly/Documents/GitHub/skerrykv/target/release/skerry",
+      "trial": 3,
+      "phases": [
+        {
+          "phase": "single_write",
+          "operations": 128,
+          "seconds": 2.776606374885887,
+          "ops_per_second": 46.09944036639351
+        },
+        {
+          "phase": "duplicate_write",
+          "operations": 128,
+          "seconds": 0.03239187481813133,
+          "ops_per_second": 3951.6082572766704
+        },
+        {
+          "phase": "random_read",
+          "operations": 128,
+          "seconds": 0.014198833843693137,
+          "ops_per_second": 9014.824837664768
+        },
+        {
+          "phase": "batch64_write",
+          "operations": 128,
+          "seconds": 0.04002525005489588,
+          "ops_per_second": 3197.9812699344543
+        },
+        {
+          "phase": "mixed_25_percent_write",
+          "operations": 128,
+          "seconds": 0.12221474992111325,
+          "ops_per_second": 1047.3367583096228
+        }
+      ],
+      "profile": "after"
+    },
+    {
+      "binary": "/Users/tbkelly/Documents/GitHub/skerrykv/target/release/skerry-v0.1.0",
+      "trial": 3,
+      "phases": [
+        {
+          "phase": "single_write",
+          "operations": 128,
+          "seconds": 1.6067489159759134,
+          "ops_per_second": 79.66397159338045
+        },
+        {
+          "phase": "duplicate_write",
+          "operations": 128,
+          "seconds": 0.03555008303374052,
+          "ops_per_second": 3600.55417812992
+        },
+        {
+          "phase": "random_read",
+          "operations": 128,
+          "seconds": 0.015728957951068878,
+          "ops_per_second": 8137.8563283209505
+        },
+        {
+          "phase": "batch64_write",
+          "operations": 128,
+          "seconds": 0.025014332961291075,
+          "ops_per_second": 5117.066291476816
+        },
+        {
+          "phase": "mixed_25_percent_write",
+          "operations": 128,
+          "seconds": 0.06789287482388318,
+          "ops_per_second": 1885.323022953986
+        }
+      ],
+      "profile": "before"
+    }
+  ],
+  "summary": [
+    {
+      "phase": "single_write",
+      "before_ops_s": 78.79345469351308,
+      "after_ops_s": 46.09944036639351,
+      "after_before": 0.5850668757412509
+    },
+    {
+      "phase": "duplicate_write",
+      "before_ops_s": 5273.5753654009495,
+      "after_ops_s": 3951.6082572766704,
+      "after_before": 0.7493224204592798
+    },
+    {
+      "phase": "random_read",
+      "before_ops_s": 8137.8563283209505,
+      "after_ops_s": 9014.824837664768,
+      "after_before": 1.1077640688115662
+    },
+    {
+      "phase": "batch64_write",
+      "before_ops_s": 5067.835161322168,
+      "after_ops_s": 3077.480947168476,
+      "after_before": 0.6072575072401487
+    },
+    {
+      "phase": "mixed_25_percent_write",
+      "before_ops_s": 1884.8533636550546,
+      "after_ops_s": 1019.311511069123,
+      "after_before": 0.5407908809906055
+    }
+  ]
+}

@@ -130,11 +130,15 @@ pub fn router_with_mcp_credentials(
         .route("/v1/status", get(status))
         .route("/v1/metrics", get(metrics))
         .route("/v1/objects", put(put_object))
-        .route("/v1/objects/{hash}", get(get_object).head(head_object))
+        .route(
+            "/v1/objects/{hash}",
+            get(get_object).head(head_object).delete(delete_object),
+        )
         .route("/v1/objects/batch-get", post(batch_get))
         .route("/v1/objects/batch-put", post(batch_put))
         .route("/v1/cache/stats", get(cache_stats))
         .route("/v1/admin/cache-clear", post(cache_clear))
+        .route("/v1/admin/gc", post(collect_garbage))
         .route("/v1/admin/shutdown", post(shutdown_handler))
         .with_state(app.clone())
         .merge(mcp)
@@ -166,6 +170,21 @@ async fn admission(State(app): State<App>, req: Request, next: Next) -> Response
             .as_ref()
             .is_some_and(|t| bool::from(supplied.as_bytes().ct_eq(t.as_bytes())))
             || (!has_credentials && supplied.is_empty());
+        // Deletion always requires an explicitly configured service credential.
+        if ((req.method() == axum::http::Method::DELETE && path.starts_with("/v1/objects/"))
+            || (req.method() == axum::http::Method::POST && path == "/v1/admin/gc"))
+            && (app.token.is_none() || !admin)
+        {
+            return ApiError(
+                if has_credentials {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                "service administrator credential required".into(),
+            )
+            .into_response();
+        }
         if !admin {
             let read =
                 matches(&scoped.read) || matches(&scoped.write) || matches(&scoped.maintenance);
@@ -434,6 +453,35 @@ fn parse_priority(value: Option<&str>) -> std::result::Result<Priority, ApiError
         )),
     }
 }
+#[derive(Deserialize, Default)]
+struct GcOptions {
+    #[serde(default)]
+    force: bool,
+}
+fn require_v2(app: &App) -> std::result::Result<(), ApiError> {
+    if !app.store.storage().deletion_enabled() {
+        return Err(ApiError(StatusCode::CONFLICT,
+            "v1 store requires offline upgrade: stop the service and run skerry upgrade --path <store>".into()));
+    }
+    Ok(())
+}
+async fn collect_garbage(State(app): State<App>, Query(options): Query<GcOptions>) -> ApiResult {
+    require_v2(&app)?;
+    let result = app
+        .store
+        .collect_garbage(options.force)
+        .await
+        .map_err(internal)?;
+    Ok(Json(result).into_response())
+}
+
+async fn delete_object(State(app): State<App>, Path(hash): Path<String>) -> ApiResult {
+    let hash = hash_from_text(&hash)?;
+    require_v2(&app)?;
+    app.store.delete(hash).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 async fn get_object(
     State(app): State<App>,
     Path(hash): Path<String>,
@@ -1036,6 +1084,69 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+        store.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn deletion_requires_service_credential_and_is_idempotent() {
+        use tower::ServiceExt;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.storage.root = directory.path().to_path_buf();
+        let store = Coordinator::open(config).await.unwrap();
+        let credentials = crate::mcp::Credentials {
+            service: Some("admin-secret".into()),
+            read: Some("read-secret".into()),
+            write: Some("write-secret".into()),
+            maintenance: Some("maintenance-secret".into()),
+            gateway: None,
+        };
+        let app = router_with_mcp_credentials(store.clone(), CancellationToken::new(), credentials)
+            .unwrap();
+        let inserted = store.put(Bytes::from_static(b"to delete")).await.unwrap();
+        let hash = hex::encode(inserted.hash);
+        for (credential, expected) in [
+            ("read-secret", StatusCode::FORBIDDEN),
+            ("write-secret", StatusCode::FORBIDDEN),
+            ("maintenance-secret", StatusCode::FORBIDDEN),
+            ("admin-secret", StatusCode::NO_CONTENT),
+            ("admin-secret", StatusCode::NO_CONTENT),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::delete(format!("/v1/objects/{hash}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(!store.exists(inserted.hash).await.unwrap());
+        for credential in ["read-secret", "write-secret", "maintenance-secret"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/v1/admin/gc")
+                        .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::delete("/v1/objects/not-a-hash")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         store.shutdown().await.unwrap();
     }
     #[tokio::test]

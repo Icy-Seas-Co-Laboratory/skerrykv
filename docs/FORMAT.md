@@ -1,4 +1,4 @@
-# SkerryKV binary storage format, version 1
+# SkerryKV binary storage formats, versions 1 and 2
 
 All integers are unsigned and little-endian. UUIDs are their 16 RFC 4122 bytes,
 not host-endian integers; digests are the 32 raw BLAKE3 bytes. Timestamps are Unix
@@ -43,8 +43,8 @@ that its payload is in bounds or correct. Verify the payload digest too.
 
 Records have no independent transaction-commit marker. A complete, verified
 record establishes physical integrity, not visibility, durability acknowledgment,
-or membership in the normal committed prefix. The intact index's committed end
-is authoritative during normal recovery. Do not scan past it and promote tails.
+or membership in the normal committed prefix. The selected committed metadata identifies the authoritative end: the index in
+v1 and the committed mutation journal in v2. Do not scan past it and promote tails.
 
 ## Seal footer: 96 bytes
 
@@ -88,7 +88,7 @@ One Fjall database, with key-value separation explicitly disabled.
 
 | Offset | Size | Meaning |
 |---|---|---|
-| 0 | 1 | Metadata encoding version, 1 |
+| 0 | 1 | Metadata encoding version, 1 or 2 |
 | 1 | 1 | State: 0 active, 1 sealed, 2 quarantined |
 | 2 | 2 | Relative path byte length |
 | 4 | 8 | File length / logical allocated capacity at publication |
@@ -101,6 +101,10 @@ One Fjall database, with key-value separation explicitly disabled.
 | 53 | 32 | Whole-segment digest, zero if absent |
 | 85 | variable | Relative UTF-8 segment path |
 
+Version 2 metadata appends two u64 LE values after the path: `garbage_since`
+and `compacted` Unix timestamps. Version 1 has no appended values, interpreted
+as zero. Both metadata encodings can occur in a v2 store.
+
 Live bytes can be less than physical record payload bytes after deduplicating
 an import. Empty objects still count as objects. Physical length is distinct
 from committed end. Growth factor 2 uses `set_len` geometrically, with no claim
@@ -111,7 +115,9 @@ of active files; verification alone does not truncate them.
 
 Generation directories are `index/generation-<UUID>/`. Immutable activation
 records are `index/activation-<20-digit-sequence>.json`. Contents are a JSON
-object `{version:1,generation:<directory-name>,sequence:<integer>}` encoded as
+object `{version:1,generation:<directory-name>,sequence:<integer>}` for v1,
+or `{version:2,generation:<directory-name>,sequence:<integer>,journal:<name>}`
+for v2, encoded as
 UTF-8, followed by four LE bytes containing CRC-32 of exactly the JSON bytes.
 No trailing newline is required. `.activation-*.tmp` files are unpublished.
 
@@ -121,8 +127,64 @@ previously nonexistent activation filename and synchronizes the containing
 directory where supported. No existing generation is renamed or replaced.
 The highest activation filename selects the generation. An invalid newest
 record or missing selected generation fails closed. Never automatically select
-an older generation: it may omit acknowledged writes. Old generations are
-retained for operator recovery, not automatic rollback.
+an older generation: it may omit acknowledged writes. Old generations can be retained for operator recovery, not automatic rollback;
+offline vacuum removes obsolete generations after activating its replacement.
+
+## Version 2 mutation journal
+
+New stores use v2. Existing v1 stores require offline `skerry upgrade` to create
+a journal checkpoint and activate v2 before deletion, GC, or vacuum. Older
+binaries reject v2 activation records; do not use them on an upgraded store.
+Segments retain the v1 physical header, record and footer encodings above.
+
+The selected `journal-<UUID>.log` is the authoritative committed namespace.
+The v2 activation selects the index generation and journal together. A matching
+checksummed `format-v2` root marker also identifies the selected journal if the
+index directory is lost. The journal is replayed to reconstruct the Fjall
+`objects`, `segments`, `tombstones`, and `retired` keyspaces. A tombstone maps the raw hash
+to an eight-byte LE deletion timestamp; a later PUT removes it.
+
+The journal starts with two 64-byte witness slots (128 bytes total). Each slot has:
+
+| Offset | Size | Meaning |
+|---|---|---|
+| 0 | 8 | ASCII `SKRYJNL2` |
+| 8 | 2 | Version, 2 |
+| 10 | 2 | Header length, 64 |
+| 12 | 8 | Witnessed committed end offset |
+| 20 | 8 | Witness generation |
+| 28 | 32 | Reserved, zero |
+| 60 | 4 | CRC-32 of bytes `[0,60)` |
+
+The highest valid generation selects the witnessed end. If one slot is invalid,
+recovery requires a complete valid frame beyond the surviving witness and no
+incomplete tail; otherwise it fails closed. This permits recovery from a torn
+witness update after the frame was synchronized.
+
+Each subsequent batch is a 20-byte header, JSON body, and 12-byte trailer,
+with offsets below relative to the start of the batch:
+
+| Offset | Size | Meaning |
+|---|---|---|
+| 0 | 8 | ASCII `SKRYMUT2` |
+| 8 | 8 | JSON body length, 1 through 16 MiB |
+| 16 | 4 | CRC-32 of header bytes `[0,16)` |
+| 20 | variable | JSON array of mutation values |
+| 20 + length | 8 | ASCII `SKRYCMT2` |
+| 28 + length | 4 | CRC-32 of JSON body |
+
+Mutation values represent `Put` (hash and encoded location), `Delete` (hash and
+Unix timestamp), `Segment` (UUID and encoded metadata), `Retire` (UUID), and
+`Cleaned` (UUID). A journal truncated below the witness, or a witness inside a
+frame, fails closed. An incomplete tail beyond the witness is excluded. A
+complete frame with an invalid checksum or commit marker is corruption, including
+at EOF. A complete valid frame beyond the witness can recover as an unacknowledged
+mutation; startup advances and synchronizes the witness before accepting writes.
+Payload and segment data are synchronized before the journal transaction that
+makes them visible. The complete frame is appended and synchronized, then the
+witness header is updated and synchronized, then Fjall is applied and synchronized
+before acknowledgment. A durable mutation can survive a lost response. Replay must not
+infer liveness from physical records: doing so could resurrect a deleted object.
 
 ## Recovery, rebuilding, and import
 
@@ -133,7 +195,9 @@ truncated. A fully synchronized, valid interrupted seal is reconciled. Unknown
 unreferenced `.seg` files remain untouched with a warning; `verify` reports them.
 Unpublished `.import-*.tmp` files are removed during normal recovery.
 
-Strict disaster rebuilding includes validated sealed files only and reports
+For v2, rebuilding replays the selected journal into a new generation and validates
+referenced segment prefixes, including committed active records. For v1, strict
+disaster rebuilding includes validated sealed files only and reports
 excluded active files. `--salvage` additionally includes verified active prefixes,
 possibly containing unacknowledged writes. Incomplete trailing headers/payloads
 and all-zero growth capacity are excluded; malformed headers or digest failures
@@ -146,7 +210,10 @@ present, with one hash mapping.
 Import accepts an offline store root, its `segments` directory, or an export
 directory of independent sealed `.seg` files. Export nesting is limited to 16
 levels; symlinks are rejected. File names must contain the exact UUID. Active
-files are excluded and reported. Payloads are copied, synchronized, independently
+files are excluded and reported. A v2 store-root source uses its journal to filter
+for live mappings. Raw segment directories and independent segment bundles lack
+deletion history and are not logical backups; importing them can include records
+that were deleted in their source store. Payloads are copied, synchronized, independently
 verified, and installed before index publication. A UUID conflict requires exact
 file equality, checked with bounded buffers; differing footer metadata also
 constitutes a conflict. Existing object-hash mappings win.
@@ -161,7 +228,8 @@ and can be registered on retry. Source payload files are never modified.
 ## Synchronization assumptions
 
 Successful PUTs synchronize payload data and file metadata before atomically
-publishing object locations and segment committed end, then synchronizing Fjall
+publishing object locations and segment committed end. In v2, the committed
+mutation frame and witness are synchronized first; then the index is published and Fjall is synchronized
 with `PersistMode::SyncAll` before acknowledgment. Previously acknowledged writes
 must survive process termination. Unacknowledged writes may survive too. An I/O
 or persistence failure faults the writer until restart; validated reads can

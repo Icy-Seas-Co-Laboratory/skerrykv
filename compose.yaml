@@ -10,7 +10,7 @@ services:
     volumes:
       - skerry-data:/var/lib/skerry
     healthcheck:
-      test: ["CMD", "skerry", "status", "--url", "http://127.0.0.1:7788"]
+      test: ["CMD", "skerry", "health", "--url", "http://127.0.0.1:7788"]
       interval: 20s
       timeout: 3s
       retries: 3

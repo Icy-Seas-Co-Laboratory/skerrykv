@@ -48,7 +48,16 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Check the health and measured counters of a running service.
+    /// Probe service health; exits unsuccessfully when the service is unhealthy.
+    Health {
+        #[arg(
+            long = "connect",
+            alias = "url",
+            default_value = "http://127.0.0.1:7788"
+        )]
+        connect: String,
+    },
+    /// Show the health and measured counters of a running service.
     Status {
         #[arg(
             long = "connect",
@@ -67,6 +76,39 @@ enum Command {
             default_value = "http://127.0.0.1:7788"
         )]
         connect: String,
+    },
+    /// Delete an object using the service administrator credential.
+    Delete {
+        hash: String,
+        #[arg(
+            long = "connect",
+            alias = "url",
+            default_value = "http://127.0.0.1:7788"
+        )]
+        connect: String,
+    },
+    /// Run one online garbage collection pass with the service administrator credential.
+    Gc {
+        #[arg(long)]
+        force: bool,
+        #[arg(
+            long = "connect",
+            alias = "url",
+            default_value = "http://127.0.0.1:7788"
+        )]
+        connect: String,
+    },
+    /// Upgrade an offline store to the current mutation format.
+    Upgrade {
+        #[arg(long, default_value = "./data")]
+        path: PathBuf,
+    },
+    /// Rewrite an offline store to reclaim obsolete data.
+    Vacuum {
+        #[arg(long, default_value = "./data")]
+        path: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Verify segment integrity offline.
     Verify {
@@ -211,6 +253,10 @@ async fn main() -> Result<()> {
         Command::Tui { connect, config } => {
             skerrykv::tui::run_with_config(&connect, token(), None, config.as_deref()).await?
         }
+        Command::Health { connect } => {
+            let v = request_json(&connect, "/v1/health", reqwest::Method::GET).await?;
+            output_json(v, false);
+        }
         Command::Status { connect, json } => {
             let v = request_json(&connect, "/v1/status", reqwest::Method::GET).await?;
             output_json(v, json);
@@ -218,6 +264,51 @@ async fn main() -> Result<()> {
         Command::Stop { connect } => {
             let v = request_json(&connect, "/v1/admin/shutdown", reqwest::Method::POST).await?;
             println!("{}", v);
+        }
+        Command::Delete { hash, connect } => {
+            let mut digest = [0u8; 32];
+            if hash.len() != 64 || hex::decode_to_slice(&hash, &mut digest).is_err() {
+                bail!("expected a 64-character BLAKE3 hex digest");
+            }
+            request_json(
+                &connect,
+                &format!("/v1/objects/{}", hex::encode(digest)),
+                reqwest::Method::DELETE,
+            )
+            .await?;
+            println!("Delete acknowledged");
+        }
+        Command::Gc { force, connect } => {
+            let path = if force {
+                "/v1/admin/gc?force=true"
+            } else {
+                "/v1/admin/gc"
+            };
+            println!(
+                "{}",
+                request_json_with_timeout(
+                    &connect,
+                    path,
+                    reqwest::Method::POST,
+                    token(),
+                    Duration::from_secs(3600)
+                )
+                .await?
+            );
+        }
+        Command::Upgrade { path } => {
+            let cfg = offline_config(&path)?;
+            println!(
+                "{}",
+                tokio::task::spawn_blocking(move || Store::upgrade(&cfg)).await??
+            );
+        }
+        Command::Vacuum { path, dry_run } => {
+            let cfg = offline_config(&path)?;
+            println!(
+                "{}",
+                tokio::task::spawn_blocking(move || Store::vacuum(&cfg, dry_run)).await??
+            );
         }
         Command::Verify { path } => {
             let cfg = offline_config(&path)?;
@@ -498,9 +589,16 @@ async fn request_json_with_token(
     method: reqwest::Method,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    request_json_with_timeout(url, path, method, auth_token, Duration::from_secs(10)).await
+}
+async fn request_json_with_timeout(
+    url: &str,
+    path: &str,
+    method: reqwest::Method,
+    auth_token: Option<String>,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
     let mut req = client.request(method, format!("{}{}", url.trim_end_matches('/'), path));
     if let Some(t) = auth_token {
         req = req.bearer_auth(t);
@@ -525,5 +623,38 @@ fn output_json(value: serde_json::Value, json: bool) {
         }
     } else {
         println!("{value}");
+    }
+}
+
+#[cfg(test)]
+mod maintenance_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_maintenance_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["skerry", "delete", "abcd"])
+                .unwrap()
+                .command,
+            Command::Delete { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["skerry", "gc", "--force"])
+                .unwrap()
+                .command,
+            Command::Gc { force: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["skerry", "upgrade", "--path", "data"])
+                .unwrap()
+                .command,
+            Command::Upgrade { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["skerry", "vacuum", "--dry-run"])
+                .unwrap()
+                .command,
+            Command::Vacuum { dry_run: true, .. }
+        ));
     }
 }

@@ -16,6 +16,7 @@ fn help_lists_operational_commands() {
         "serve",
         "tui",
         "status",
+        "health",
         "stop",
         "verify",
         "rebuild-index",
@@ -64,4 +65,36 @@ fn init_creates_config_and_offline_verify_accepts_path() {
         "{}",
         String::from_utf8_lossy(&verify.stderr)
     );
+}
+
+#[test]
+fn health_exit_code_follows_http_health_status() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    for (response, expected) in [("200 OK", true), ("503 Service Unavailable", false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let length = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /v1/health "));
+            write!(
+                stream,
+                "HTTP/1.1 {response}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .unwrap();
+        });
+        let output = skerry()
+            .args(["health", "--url", &format!("http://{address}")])
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            output.status.success(),
+            expected,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
