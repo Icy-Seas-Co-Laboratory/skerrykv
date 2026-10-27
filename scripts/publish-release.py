@@ -108,6 +108,26 @@ def api(path, missing_ok=False):
     return json.loads(output) if output is not None else None
 
 
+def find_release(repo, tag):
+    # GitHub's tag lookup endpoint does not return drafts, even when authenticated.
+    pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repo}/releases?per_page=100'))
+    matches = [release for page in pages for release in page if release.get('tag_name') == tag]
+    if len(matches) > 1:
+        raise ValueError('multiple releases have the requested tag')
+    return matches[0] if matches else None
+
+
+def wait_for_release(repo, tag):
+    deadline = time.monotonic() + 30
+    while True:
+        release = find_release(repo, tag)
+        if release is not None:
+            return release
+        if time.monotonic() >= deadline:
+            raise ValueError('created draft did not appear in the releases list')
+        time.sleep(2)
+
+
 def verify_tag(repo, tag, commit):
     obj = api(f'repos/{repo}/git/ref/tags/{tag}').get('object', {})
     for depth in range(17):
@@ -159,9 +179,8 @@ def publish(dist, tag, commit, repo):
         raise ValueError('GH_REPO must be OWNER/REPO')
     assets = validate(dist, tag, commit)
     expected = {p.name: ('sha256:' + digest(p), p.stat().st_size) for p in assets}
-    endpoint = f'repos/{repo}/releases/tags/{tag}'
     verify_tag(repo, tag, commit)
-    release = api(endpoint, missing_ok=True)
+    release = find_release(repo, tag)
     if release is not None:
         if not release.get('draft'):
             raise ValueError('release already exists and is published; refusing to overwrite')
@@ -172,6 +191,11 @@ def publish(dist, tag, commit, repo):
         args = ['release', 'create', tag, '--verify-tag', '--target', commit, '--draft', '--title', f'SkerryKV {tag}']
         args += ['--notes-file', str(notes)] if notes.is_file() else ['--generate-notes']
         gh(*args)
+        release = wait_for_release(repo, tag)
+    release_id = release.get('id')
+    if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+        raise ValueError('release has an invalid ID')
+    endpoint = f'repos/{repo}/releases/{release_id}'
     existing = inspect_draft(endpoint, commit, expected)
     missing = [p for p in assets if p.name not in existing]
     if missing:

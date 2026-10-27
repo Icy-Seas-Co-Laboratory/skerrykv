@@ -97,13 +97,11 @@ class PublisherTests(unittest.TestCase):
             if endpoint.endswith('/latest'):
                 return {'tag_name': 'v0.3.0'}
             count = sum(1 for c in calls if c == ('api', endpoint))
-            if count == 1:
-                return None
-            return {'draft': True, 'target_commitish': COMMIT, 'assets': [] if count == 2 else self.asset_metadata(self.dist.iterdir())}
+            return {'draft': True, 'target_commitish': COMMIT, 'assets': [] if count == 1 else self.asset_metadata(self.dist.iterdir())}
         def gh(*args, **kwargs):
             calls.append(args)
             return ''
-        with patch.object(publisher, 'api', side_effect=api), patch.object(publisher, 'gh', side_effect=gh):
+        with patch.object(publisher, 'find_release', side_effect=[None, {'id': 42, 'draft': True, 'target_commitish': COMMIT}]), patch.object(publisher, 'api', side_effect=api), patch.object(publisher, 'gh', side_effect=gh):
             publisher.publish(self.dist, TAG, COMMIT, 'owner/repo')
         self.assertEqual(calls[-1], ('release', 'edit', TAG, '--draft=false', '--latest=false'))
         self.assertTrue(any(c[:3] == ('release', 'create', TAG) for c in calls))
@@ -112,12 +110,12 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(sum('/git/ref/' in c[1] for c in calls if c[0] == 'api'), 2)
 
     def test_existing_published_and_unverified_assets_fail(self):
-        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'api', return_value={'draft': False}), patch.object(publisher, 'gh') as gh:
+        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'find_release', return_value={'id': 42, 'draft': False}), patch.object(publisher, 'gh') as gh:
             with self.assertRaisesRegex(ValueError, 'published'):
                 publisher.publish(self.dist, TAG, COMMIT, 'owner/repo')
             gh.assert_not_called()
-        draft = {'draft': True, 'target_commitish': COMMIT, 'assets': []}
-        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'api', return_value=draft), patch.object(publisher, 'gh') as gh:
+        draft = {'id': 42, 'draft': True, 'target_commitish': COMMIT, 'assets': []}
+        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'find_release', return_value=draft), patch.object(publisher, 'api', return_value=draft), patch.object(publisher, 'gh') as gh:
             with self.assertRaisesRegex(ValueError, 'expected names'):
                 publisher.publish(self.dist, TAG, COMMIT, 'owner/repo')
             self.assertEqual(gh.call_count, 1)
@@ -133,17 +131,44 @@ class PublisherTests(unittest.TestCase):
                 return None
             count = sum(c == endpoint for c in calls)
             calls.append(endpoint)
-            return {'draft': True, 'target_commitish': COMMIT, 'assets': first if count < 2 else full}
-        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'api', side_effect=api), patch.object(publisher, 'gh') as gh:
+            return {'draft': True, 'target_commitish': COMMIT, 'assets': first if count < 1 else full}
+        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'find_release', return_value={'id': 42, 'draft': True, 'target_commitish': COMMIT}), patch.object(publisher, 'api', side_effect=api), patch.object(publisher, 'gh') as gh:
             publisher.publish(self.dist, TAG, COMMIT, 'owner/repo')
             upload = gh.call_args_list[0].args
             self.assertEqual(len(upload), 3 + 10)
             self.assertNotIn(str(paths[0]), upload)
         first[0]['digest'] = 'sha256:' + '0' * 64
-        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'api', return_value={'draft': True, 'target_commitish': COMMIT, 'assets': first}), patch.object(publisher, 'gh') as gh:
+        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'find_release', return_value={'id': 42, 'draft': True, 'target_commitish': COMMIT}), patch.object(publisher, 'api', return_value={'draft': True, 'target_commitish': COMMIT, 'assets': first}), patch.object(publisher, 'gh') as gh:
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 publisher.publish(self.dist, TAG, COMMIT, 'owner/repo')
             gh.assert_not_called()
+
+    def test_paginated_list_finds_draft_by_tag(self):
+        result = {'id': 425894710, 'tag_name': TAG, 'draft': True, 'target_commitish': COMMIT}
+        with patch.object(publisher, 'gh', return_value=json.dumps([[{'tag_name': 'v0.1.0'}], [result]])) as gh:
+            self.assertEqual(publisher.find_release('owner/repo', TAG), result)
+            gh.assert_called_once_with('api', '--paginate', '--slurp', 'repos/owner/repo/releases?per_page=100')
+
+    def test_existing_draft_from_list_uses_id_endpoint(self):
+        draft = {'id': 425894710, 'tag_name': TAG, 'draft': True, 'target_commitish': COMMIT}
+        calls = []
+        def gh(*args, **kwargs):
+            calls.append(args)
+            if args[:3] == ('api', '--paginate', '--slurp'):
+                return json.dumps([[draft]])
+            return ''
+        def api(endpoint, missing_ok=False):
+            if '/releases/tags/' in endpoint:
+                raise AssertionError('tag endpoint must not be used for drafts')
+            if endpoint.endswith('/latest'):
+                return None
+            self.assertEqual(endpoint, 'repos/owner/repo/releases/425894710')
+            uploads = any(c[:2] == ('release', 'upload') for c in calls)
+            return dict(draft, assets=self.asset_metadata(self.dist.iterdir()) if uploads else [])
+        with patch.object(publisher, 'verify_tag'), patch.object(publisher, 'gh', side_effect=gh), patch.object(publisher, 'api', side_effect=api):
+            publisher.publish(self.dist, TAG, COMMIT, 'owner/repo')
+        self.assertTrue(any(c[:2] == ('release', 'upload') for c in calls))
+        self.assertEqual(calls[-1][:2], ('release', 'edit'))
 
     def test_tag_dereferences_and_rejects_wrong_commit(self):
         annotated = 'b' * 40
