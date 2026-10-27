@@ -1,0 +1,43 @@
+{
+  "blake3": "1.0.9",
+  "cache_condition": "Explicit full read pass before each timed read phase; all data fits RAM; no OS cache eviction; no cold-cache or HDD claims.",
+  "completed": true,
+  "completed_cases": 48,
+  "completed_utc": "2026-10-27T00:23:39.975195+00:00",
+  "cpu": "Apple M3 Max",
+  "disk_free_bytes_start": 84845506560,
+  "durability_caveat": "KV2 current WAL NORMAL vs Skerry SyncAll; FULL+verify is benchmark-only sensitivity, not production KV2 behavior.",
+  "fixture_work_root": "/Users/tbkelly/Documents/GitHub/skerrykv/kv2-compare-xptt_g5y",
+  "load_average_start": [
+    3.69921875,
+    4.89794921875,
+    5.12109375
+  ],
+  "machine": "arm64",
+  "memory_bytes": "137438953472",
+  "os_posix_fallocate_available": false,
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.2 | packaged by conda-forge | (main, Feb 16 2024, 20:54:21) [Clang 16.0.6 ]",
+  "records": 1024,
+  "rss_scope": "whole child/family, including fixture preload, initialization and warmups; not backend-only memory",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "seed": 20261026,
+  "service_batch_delay_ms": 1,
+  "sources": {
+    "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/default.config.toml": "08036a509068598ee8ad9ad3401c7d68e42b7b580a038282185a4cf77d9f10ce",
+    "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/services/context.py": "202b0d339c62616ef2bf61ecebdb64cd4d74925862af948c92d8973cee3acd2f",
+    "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/storage/kvstore2.py": "5d48a7fb2abb858d60e8f0273037db939e9e50cc10621059f5f78b8a17d14075",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/Cargo.lock": "6568718c81fee3835976945cc7724e64f2705906bbdffdfeb27c0abe54a6d1d3",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/benchmarks/compare_pelagia.py": "415690e72de342f90433a7bcca26775552b68f55aa65eb618a84f169b941a52b",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/examples/compare_kvstore2.rs": "cdd695bd8c65f986ee8c56f19f277036a7bf473a2e50e62e7215c30a49715b81",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/config.rs": "6fae9c148a690f576c3af9627ccadd54a4bc82a3a7a697fd573e4fe780a1d618",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/coordinator.rs": "ece09bff6224ca3be24bf2e1f282c0e51e2a9ff5e266cddd00ac8fda48fb5ca5",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/engine.rs": "7589aa99b87f1de80f867258764b696383f4d1af429936ebdbfb5c654989b6e4",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/server.rs": "a55e78bc3d950ae7b8bcbbf27f9ceff7a7227117f16ed2a08c68226b34d3f372"
+  },
+  "sqlite": "3.45.3",
+  "sqlite_context_manager": "kv2_current uses production cache/context semantics; harness does not add pooling; kv2_full_verify overrides connections and bypasses production cache",
+  "started_utc": "2026-10-27T00:18:54.380351+00:00",
+  "trials": 3,
+  "workers": 8
+}

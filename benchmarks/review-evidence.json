@@ -1,0 +1,11 @@
+{
+  "source": "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/storage/kvstore2.py",
+  "ordinary_read_returned_same_size_corrupt_payload": true,
+  "deep_verification_detected_corruption": true,
+  "age_expired_lock_reacquired_while_prior_owner_alive": true,
+  "lock_test_uses_short_configured_ttl_seconds": 0.005,
+  "production_default_ttl_seconds": 3600,
+  "all_probes_used_disposable_stores": true,
+  "lock_probe_demonstrates_payload_corruption": false,
+  "lock_qualification": "SQLite BEGIN IMMEDIATE independently serializes both examined append paths; the probe demonstrates only a file-lock ownership failure."
+}

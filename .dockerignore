@@ -1,0 +1,6 @@
+target
+.git
+.github
+config.toml
+data
+*.log

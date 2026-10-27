@@ -1,0 +1,10 @@
+{
+  "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/default.config.toml": "00-default.config.toml",
+  "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/storage/kvstore2.py": "01-kvstore2.py",
+  "/Users/tbkelly/Documents/GitHub/skerrykv/Cargo.lock": "02-Cargo.lock",
+  "/Users/tbkelly/Documents/GitHub/skerrykv/benchmarks/compare_pelagia.py": "03-compare_pelagia.py",
+  "/Users/tbkelly/Documents/GitHub/skerrykv/examples/compare_kvstore2.rs": "04-compare_kvstore2.rs",
+  "/Users/tbkelly/Documents/GitHub/skerrykv/src/coordinator.rs": "05-coordinator.rs",
+  "/Users/tbkelly/Documents/GitHub/skerrykv/src/engine.rs": "06-engine.rs",
+  "/Users/tbkelly/Documents/GitHub/skerrykv/src/server.rs": "07-server.rs"
+}

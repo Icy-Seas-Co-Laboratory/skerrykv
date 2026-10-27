@@ -1,0 +1,15 @@
+/target/
+/data/
+/config.toml
+/skerry-bench-data/
+/bench-store/
+/bench-suite/
+.env
+*.core
+core
+.DS_Store
+
+# Disposable comparison workspaces
+/kv2-compare-*/
+/kv2-fullsync-*/
+/benchmarks/__pycache__/

@@ -1,0 +1,18 @@
+{
+  "benchmark_only_adaptations": [
+    "SQLite synchronous=FULL",
+    "SQLite fullfsync=ON",
+    "replace Python os.fsync with fcntl(F_FULLFSYNC) inside isolated child",
+    "BLAKE3 verification after each ordinary read"
+  ],
+  "completed": true,
+  "completed_cases": 18,
+  "completed_utc": "2026-10-26T23:41:53.786203+00:00",
+  "pelagia_source_sha256": "7bf06f10e5c6a99a0053dac059367820545e85aeb9c60a5b92c1303e2e8c4351",
+  "primary_harness_sha256": "9ccfc2e17dd737597ac944e1c219cadcf8d213efd8f6c5769544e6c71c2bd00c",
+  "records": 256,
+  "started_utc": "2026-10-26T23:38:52.076606+00:00",
+  "supplement_sha256": "ca03a79eda1336edce540c51eb850920b819dedb7a25b78418578938de25fe4d",
+  "trials": 3,
+  "workers": 8
+}

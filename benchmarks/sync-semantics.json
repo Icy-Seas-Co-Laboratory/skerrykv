@@ -1,0 +1,14 @@
+{
+  "rust_toolchain": "rustc 1.94.1",
+  "installed_rust_source_sha256": "81fc4fe586ea697c0ac94f44aca553d8e1687179d287b5a1709ceef799ad660b",
+  "installed_source_excerpt": "pub fn fsync(&self) -> io::Result<()> {\n1382        cvt_r(|| unsafe { os_fsync(self.as_raw_fd()) })?;\n1383        return Ok(());\n1384\n1385        #[cfg(target_vendor = \"apple\")]\n1386        unsafe fn os_fsync(fd: c_int) -> c_int {\n1387            libc::fcntl(fd, libc::F_FULLFSYNC)\n1388        }\n1389        #[cfg(not(target_vendor = \"apple\"))]\n1390        unsafe fn os_fsync(fd: c_int) -> c_int {\n1391            libc::fsync(fd)\n1392        }\n1393    }\n1394\n1395    pub fn datasync(&self) -> io::Res",
+  "python_blob_sync": "os.fsync (libc fsync on this Unix build)",
+  "sqlite_default_fullfsync": 0,
+  "python_fcntl_F_FULLFSYNC_supported": true,
+  "sources": [
+    "https://doc.rust-lang.org/src/std/sys/fs/unix.rs.html",
+    "https://www.sqlite.org/pragma.html#pragma_fullfsync",
+    "https://docs.python.org/3.12/library/os.html#os.fsync"
+  ],
+  "qualification": "Source/flag verification, not OS syscall tracing or a power-loss test."
+}

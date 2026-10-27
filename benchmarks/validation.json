@@ -1,0 +1,28 @@
+{
+  "rust_tests": {
+    "command": "cargo test --locked",
+    "passed": 81
+  },
+  "rust_lint": {
+    "command": "cargo clippy --locked --all-targets -- -D warnings",
+    "passed": true
+  },
+  "rust_format": {
+    "command": "cargo fmt --all --check",
+    "passed": true
+  },
+  "pelagia_tests": {
+    "command": ".venv/bin/pytest tests/test_kvstore2.py tests/test_kvstore.py tests/test_project_isolation.py -q",
+    "passed": 79,
+    "warnings": "Existing Starlette httpx deprecation warning"
+  },
+  "benchmark_cases": 189,
+  "benchmark_operations": 1427328,
+  "reported_operation_errors": 0,
+  "notes": [
+    "Historical and intermediate measured sources are archived with matching SHA-256 hashes.",
+    "Rust benchmark example formatting was normalized after measurements; its exact measured source is archived.",
+    "No durability or read-integrity settings were weakened.",
+    "Workspace config.toml batching delay set to 1 ms; other deployment configs retain their values."
+  ]
+}

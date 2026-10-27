@@ -1,0 +1,246 @@
+{
+  "cache": null,
+  "config": {
+    "batch_delay_ms": 10,
+    "durability": "SyncAll",
+    "mixed_workload": "mixed_order is a random permutation; mixed_write_positions independently select ceil(N/4) new writes; remaining positions read originals",
+    "operations": 1024,
+    "payload_cache_mib": 0,
+    "read_warmup": "full pass before each phase; two passes for enabled coordinator cache; OS cache warm; no cold-cache claim",
+    "runtime_worker_threads": 8,
+    "seed": 20261026,
+    "storage_config": {
+      "cache": {
+        "admission_entries": 65536,
+        "admission_window_seconds": 300,
+        "index_mib": 128,
+        "payload_mib": 0
+      },
+      "logging": {
+        "level": "info"
+      },
+      "mcp": {
+        "allow_verification": false,
+        "allowed_origins": [],
+        "auth_gateway": false,
+        "enabled": true,
+        "external_url": null,
+        "http_path": "/mcp",
+        "max_concurrent_requests": 16,
+        "max_encoded_response_kib": 512,
+        "max_inline_object_kib": 128,
+        "max_list_page_size": 100,
+        "max_put_object_kib": 128,
+        "max_request_kib": 256,
+        "max_response_memory_mib": 16,
+        "max_retained_jobs": 64,
+        "max_verification_jobs": 1,
+        "read_only": true,
+        "requests_per_minute": 120,
+        "tool_timeout_seconds": 30,
+        "verification_timeout_seconds": 300
+      },
+      "reads": {
+        "hdd_window_ms": 4,
+        "max_concurrency": 32,
+        "policy": "ssd",
+        "queue_items": 1024
+      },
+      "resources": {
+        "max_batch_items": 4096,
+        "max_inflight_read_mib": 256,
+        "max_object_mib": 64,
+        "max_open_segments": 256,
+        "max_requests": 128
+      },
+      "segments": {
+        "growth_factor": 1,
+        "max_size_bytes": 8589934592
+      },
+      "server": {
+        "listen": "127.0.0.1:7788",
+        "request_timeout_seconds": 120,
+        "shutdown_timeout_seconds": 30
+      },
+      "storage": {
+        "root": "/Users/tbkelly/Documents/GitHub/skerrykv/kv2-compare-ufdciu2t/cases/20k__skerry_engine__sequential__trial3/store"
+      },
+      "writes": {
+        "batch_max_delay_ms": 10,
+        "batch_max_records": 512,
+        "max_pending_mib": 256
+      }
+    },
+    "workers": 8,
+    "write_pattern": "Sequential"
+  },
+  "dataset": "20k",
+  "engine": "skerry_engine",
+  "filesystem": {
+    "all_file_allocated_bytes": 27717632,
+    "all_file_logical_bytes": 93411905,
+    "file_count": 17
+  },
+  "io": null,
+  "phases": [
+    {
+      "elapsed_seconds": 10.009011083,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 9149.75,
+      "latency_p95_us": 10846.916,
+      "latency_p99_us": 13393.333,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 177258.04200000002,
+      "mib_per_second": 1.998199405930261,
+      "name": "write_sequential",
+      "operations": 1024,
+      "ops_per_second": 102.30780958362936
+    },
+    {
+      "elapsed_seconds": 0.014831166,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 14.208,
+      "latency_p95_us": 16.166,
+      "latency_p99_us": 19.208,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 24.459,
+      "mib_per_second": 1348.511640959315,
+      "name": "write_duplicate",
+      "operations": 1024,
+      "ops_per_second": 69043.79601711693
+    },
+    {
+      "elapsed_seconds": 0.020428875,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 18.584,
+      "latency_p95_us": 19.5,
+      "latency_p99_us": 20.208000000000002,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 23.375,
+      "mib_per_second": 979.0064308484926,
+      "name": "read_sequential",
+      "operations": 1024,
+      "ops_per_second": 50125.12925944282
+    },
+    {
+      "elapsed_seconds": 0.021162333,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 18.833000000000002,
+      "latency_p95_us": 19.791999999999998,
+      "latency_p99_us": 20.584000000000003,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 24.208,
+      "mib_per_second": 945.075384646863,
+      "name": "read_random",
+      "operations": 1024,
+      "ops_per_second": 48387.85969391938
+    },
+    {
+      "elapsed_seconds": 0.018284541,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 16.916,
+      "latency_p95_us": 18.208,
+      "latency_p99_us": 19.458,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 21.209,
+      "mib_per_second": 1093.8201839466465,
+      "name": "read_hot",
+      "operations": 1024,
+      "ops_per_second": 56003.593418068296
+    },
+    {
+      "elapsed_seconds": 0.005693334,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 33.458,
+      "latency_p95_us": 62.458000000000006,
+      "latency_p99_us": 151.042,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 309.875,
+      "mib_per_second": 3512.88015071661,
+      "name": "read_concurrent_random",
+      "operations": 1024,
+      "ops_per_second": 179859.46371669043
+    },
+    {
+      "elapsed_seconds": 0.021678333,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 18.916999999999998,
+      "latency_p95_us": 22.125,
+      "latency_p99_us": 23.084,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 25.541,
+      "mib_per_second": 922.5801633363598,
+      "name": "read_batch_ordered64",
+      "operations": 1024,
+      "ops_per_second": 47236.10436282162
+    },
+    {
+      "elapsed_seconds": 0.005789958,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 31.166,
+      "latency_p95_us": 37.167,
+      "latency_p99_us": 40.292,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 68.375,
+      "mib_per_second": 3454.2564902888757,
+      "name": "read_batch_unordered64",
+      "operations": 1024,
+      "ops_per_second": 176857.93230279043
+    },
+    {
+      "elapsed_seconds": 2.443199625,
+      "error_count": 0,
+      "errors": [],
+      "latency_p50_us": 26.416,
+      "latency_p95_us": 77870.625,
+      "latency_p99_us": 87757.166,
+      "latency_unit": "per_operation",
+      "logical_bytes": 20971520,
+      "max_us": 97785.042,
+      "mib_per_second": 8.185986849109801,
+      "name": "mixed_read_write",
+      "operations": 1024,
+      "ops_per_second": 419.12252667442186,
+      "read_logical_bytes": 15728640,
+      "read_operations": 768,
+      "write_logical_bytes": 5242880,
+      "write_operations": 256
+    }
+  ],
+  "process": {
+    "rss_sampling_interval_ms": 20,
+    "sampled_peak_family_rss_bytes": 37601280,
+    "sampled_peak_rss_bytes": 37601280,
+    "wall_seconds_including_setup_warmups": 14.423465500120074
+  },
+  "profile": "skerry_engine",
+  "setup_seconds": 0.215135166,
+  "storage": {
+    "active_bytes": 0,
+    "active_segment": null,
+    "index_bytes": 67108864,
+    "objects": 1280,
+    "open_files": 1,
+    "payload_bytes": 26214400,
+    "physical_bytes": 26296480,
+    "segments": 1
+  },
+  "trial": 3,
+  "write_pattern": "sequential"
+}

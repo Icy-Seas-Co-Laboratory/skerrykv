@@ -1,0 +1,371 @@
+# Packaged Pelagia defaults. Copy values into ./config.toml to override them
+# for a local checkout. Environment variables and CLI flags still take
+# precedence over these settings.
+
+[database]
+# PostgreSQL catalog and worker queue storage.
+dsn = "postgresql://postgres:postgres@localhost:5432/pelagia"
+schema_name = "pelagia"
+connect_timeout_s = 5
+statement_timeout_ms = 30000
+# Connections are opened lazily and reused within each API or worker process.
+pool_min_size = 0
+pool_max_size = 4
+pool_timeout_s = 10.0
+
+[queue]
+# Default job scheduling behavior. Lower priority values run first.
+default_priority = 100
+max_attempts = 3
+max_claim_count = 1
+lease_seconds = 300
+heartbeat_interval_seconds = 30
+# Do not claim new jobs when host or container available memory falls below 20%.
+min_available_memory_fraction = 0.20
+# Retryable failures are rescheduled with exponential backoff and bounded jitter.
+retry_backoff_base_seconds = 15
+retry_backoff_max_seconds = 900
+retry_backoff_jitter_seconds = 5
+
+[kvstore]
+# Parent directory for named, project-scoped stores containing large frame payloads.
+# Options: kvstore, kvstore2. Existing stores should keep kvstore unless migrated.
+backend = "kvstore2"
+directory = "./data/kvstores"
+# Options: sha256, blake3.
+hash_algorithm = "blake3"
+# Number of hash-prefix characters used to shard object storage paths.
+prefix_length = 2
+# kvstore backend rotation controls.
+max_db_bytes = 68_719_476_736
+max_rows = 1000000
+# kvstore2 blob-shard size limit.
+max_blob_bytes = 68_719_476_736
+
+[file_browser]
+# Server-side roots exposed through /live/files for local file/folder selection.
+# The file API cannot browse outside root_path_kvstore, root_path_import_dir,
+# or explicitly listed allowed_root_paths.
+root_path_kvstore = "./data/kvstores"
+root_path_import_dir = "./data/import"
+allowed_root_paths = []
+
+[image_data_storage]
+# Default image payload encoding. Options: zstd, png, jpg, jxl, jxs, raw.
+encoding = "jpg"
+# Default lossy image quality for jpg and jxl payloads.
+quality = 75
+# Deployment-level codec allowlist. Pelagia only advertises and accepts storage
+# codecs listed here; optional codecs must also be available in imagecodecs.
+allowed_encodings = ["zstd", "png", "jpg", "jxl", "jxs", "raw"]
+
+[auth]
+# Enable bearer-token authentication for API clients. Set false for single-user
+# local development; requests then run as an admin-scoped dev session against
+# dev_project_key instead of seeing all projects.
+enabled = true
+# Default session lifetime for login and project-switch tokens.
+session_ttl_seconds = 604800
+# Project used when auth.enabled=false. Configure this after creating a project.
+dev_project_key = null
+# Optional bootstrap credentials for scripted local setup.
+bootstrap_admin_username = null
+bootstrap_admin_password = null
+bootstrap_admin_display_name = null
+
+[processing.mask_augmentation]
+# Binary-mask cleanup after thresholding and before candidate assembly.
+enabled = false
+# Ordered steps. Options: dilate, erode, open, close, fill_holes,
+# remove_small_components, clear_border, none.
+steps = ["dilate"]
+dilate_kernel_w = 3
+dilate_kernel_h = 3
+dilate_iterations = 1
+erode_kernel_w = 3
+erode_kernel_h = 3
+erode_iterations = 1
+open_kernel_w = 3
+open_kernel_h = 3
+open_iterations = 1
+close_kernel_w = 3
+close_kernel_h = 3
+close_iterations = 1
+fill_holes = false
+remove_small_components = false
+min_component_area = 1
+clear_border = false
+
+[processing.roi_assembly]
+# Candidate ROI assembly from the augmented mask.
+# Options: connected_components, contours.
+method = "connected_components"
+connectivity = 8
+
+[processing.roi_filter]
+# Candidate ROI filters. Null disables a given criterion.
+min_area = null
+max_area = null
+# Perimeter uses the candidate bounding-box perimeter.
+min_perimeter = null
+max_perimeter = null
+min_width = 10
+max_width = null
+min_height = 10
+max_height = null
+# Width + height is often easier to reason about than box perimeter.
+min_width_plus_height = null
+max_width_plus_height = null
+
+[processing.roi_recording]
+# Stored candidate ROI payload and mask behavior.
+padding = 50
+# ROI size uses padded crop width × height; channel count and dtype do not alter
+# the classification. Crops at or above the cutoff use the large-ROI policy.
+small_roi_encoding = "zstd"
+large_roi_encoding = "jpg"
+large_roi_min_pixels = 1000
+# Lossy ROI quality for jpg and jxl payloads.
+roi_quality = 75
+# Masks are independent scientific payloads and remain lossless by default.
+mask_encoding = "zstd"
+# Store masks for every retained candidate, even when ROI image bytes are skipped.
+always_store_mask = true
+# ROI image blobs are only stored when all non-null thresholds are satisfied.
+store_roi_payload_min_area = null
+store_roi_payload_min_width = 10
+store_roi_payload_min_height = 10
+store_roi_payload_min_width_plus_height = 50
+
+[processing.video_ingest]
+# Video-to-frame extraction defaults. Frame storage preserves extracted pixels;
+# downstream processing steps own correction and segmentation transforms.
+# Number of source video frames stacked into one stored frame/tile.
+n_tile = 4
+# Prefer CPU/software decode for reliability with codecs such as AV1 on systems
+# where hardware acceleration is unavailable or misreported.
+prefer_software_decode = true
+# Limit OpenCV image operations within each ingest worker.
+opencv_threads = 1
+# Limit FFmpeg decoding in both VideoCapture and the CLI fallback.
+decoder_threads = 1
+
+[processing.flatfield]
+# Flatfield correction defaults used during ingestion and segmentation.
+flatfield_correction = true
+# Fallback quantile for older frames without an ingestion-generated mean profile.
+flatfield_q = 0.5
+# Profile reduction/stacking axis: 0 stacks frames vertically and produces
+# column means; 1 stacks horizontally and produces row means.
+flatfield_axis = 0
+# Line-scan profile generation defaults to one profile per frame.
+background_window_stride = 1
+background_window_width = 1
+# Bound the estimated field before division: values below min become 0, values above max become 255.
+flatfield_min_field_value = 25
+flatfield_max_field_value = 255
+
+[processing.thresholding]
+# Candidate mask generation defaults.
+#
+# Method options:
+# - manual: fixed grayscale threshold using manual_threshold.
+# - otsu: Otsu automatic thresholding with optional maximum cap.
+# - bounded_otsu: Otsu with minimum contrast and foreground-fraction safeguards.
+# - bounded_otsu_canny: bounded_otsu with optional Canny edge support.
+# - canny: standalone Canny edge detection.
+# - adaptive_mean/adaptive_gaussian: local adaptive thresholding.
+# - percentile_background: background percentile plus minimum contrast.
+# - hysteresis: connected weak/strong thresholding.
+# - sobel_edges: Sobel gradient thresholding.
+method = "manual"
+
+# Manual threshold method.
+manual_threshold = 100
+
+# Otsu-style methods.
+# Maximum threshold value used when Otsu-style thresholding is capped.
+thresholding_maximum_value = 100
+
+# Bounded Otsu rejects weak foreground/background separation and overly full masks.
+bounded_otsu_min_contrast = 50
+bounded_otsu_max_foreground_fraction = 0.5
+
+# Canny edge detection.
+# Used by the standalone canny method and as optional support for bounded_otsu_canny.
+canny_enabled = false
+canny_low_threshold = 60
+canny_high_threshold = 120
+canny_blur_kernel = 5
+
+# Adaptive threshold window size and constant offset.
+adaptive_block_size = 31
+adaptive_c = 5
+
+# Percentile-background threshold estimates background brightness, then adds contrast.
+percentile_background_percentile = 50
+percentile_min_contrast = 50
+
+# Hysteresis keeps weak pixels only when connected to strong pixels.
+hysteresis_low_threshold = 30
+hysteresis_high_threshold = 80
+hysteresis_connectivity = 8
+
+# Sobel edge thresholding uses a gradient percentile unless sobel_threshold is set.
+sobel_percentile = 90
+sobel_threshold = null
+sobel_kernel_size = 3
+
+[processing.preprocessing]
+# Frame preprocessing defaults used before candidate detection.
+# Processing order is: grayscale -> optional crop -> optional mask ->
+# optional flatfield -> optional background correction -> optional inversion.
+# Enable mask application when a frame mask is available or mask_path is set.
+apply_mask = false
+# Frame mask controls. Use null when no mask file is configured.
+mask_path = null
+# Future adaptive background-subtraction controls.
+adaptive_background_subtraction = false
+adaptive_background_period = 50
+# Mean backgrounds generated during ingestion use fixed application groups and
+# may use a wider source window for natural temporal smoothing.
+background_window_stride = 25
+background_window_width = 25
+# Divide by a generated mean background field before inversion and thresholding.
+background_correction = false
+# Clamp the background field before division. Min must be > 0; max may be null.
+background_min_field_value = 50
+background_max_field_value = 255
+# Convert dark-foreground imagery to Pelagia's bright-foreground convention.
+invert_intensity = true
+# Crop uses x/y origin plus width/height in source-frame pixels. Leave disabled
+# or use null values when no default crop should be applied.
+crop_enabled = false
+crop_x = null
+crop_y = null
+crop_w = null
+crop_h = null
+
+[processing.frame_storage]
+# Stored frame payload encoding. Options: zstd, png, jpg, jxl, jxs, raw.
+image_encoding = "jpg"
+# Stored frame lossy image quality for jpg and jxl payloads.
+image_quality = 75
+
+[processing.thumbhash]
+# Maximum image dimension before RGBA expansion and ThumbHash encoding (1-100).
+max_dim = 100
+
+[processing.roi_refinement]
+# Default CPU-only refiner. Oracle Builder remains available with method="oracle".
+default_method = "heuristic_edge_v1"
+# Strong-gradient percentile and axis exclusion used by heuristic_edge_v1.
+heuristic_gradient_percentile = 90.0
+heuristic_axis_exclusion_degrees = 10.0
+heuristic_max_growth_pixels = 32
+# Gradient-aware seeded expansion options for heuristic_v2.
+v2_max_growth_pixels = 32
+v2_threshold_step = 4.0
+# Null derives the intensity floor from local background noise.
+v2_minimum_foreground_intensity = null
+v2_minimum_boundary_coverage = 0.55
+v2_stable_area_growth_ratio = 0.35
+# Direct seed-constrained graph cut. Null estimates gradient scale per crop.
+v3_max_growth_pixels = 32
+v3_foreground_fraction = 0.10
+v3_intensity_weight = 2.0
+v3_boundary_weight = 3.0
+v3_growth_penalty = 0.20
+v3_gradient_sigma = null
+v3_max_graph_pixels = 100000
+max_iterations = 5
+# Crop growth distance when a refined mask touches an uncovered edge.
+expansion_pixels = 256
+edge_touch_margin = 2
+# Null reuses candidate ROI encoding for refined records.
+encoding = null
+# Drop refined ROIs that substantially overlap a larger refined ROI on the same frame.
+overlap_reconciliation_enabled = true
+# Consume duplicate refined ROIs when mask IoU is at least this value.
+overlap_iou_threshold = 0.5
+# Consume duplicate refined ROIs when either mask is mostly contained by the other.
+overlap_containment_threshold = 0.8
+# Optionally discover additional valid targets left in the candidate mask after refinement.
+residual_discovery_enabled = true
+# Maximum recursive split generations to try.
+residual_max_iterations = 1
+# Null reuses the candidate's original assembly method when available.
+residual_roi_assembly_method = null
+# Connected-components connectivity for residual assembly. Options: 4, 8.
+residual_roi_assembly_connectivity = 8
+# Residual child filters. Null disables a given criterion.
+residual_min_area = null
+residual_min_width = null
+residual_min_height = null
+residual_min_width_plus_height = null
+# Null reuses the parent candidate padding, bounded by the current ROI crop.
+residual_padding = null
+
+[processing.roi_continuity]
+# Build auditable logical assemblies only for assets that declare line-scan geometry.
+enabled = true
+require_line_scan_metadata = true
+# Consecutive frames append along this axis; "y" is the usual line-scan layout.
+scan_axis = "y"
+boundary_band_pixels = 32
+max_frame_gap = 1
+min_link_score = 0.7
+
+[api]
+# FastAPI development server defaults.
+host = "127.0.0.1"
+port = 8000
+# Optional externally visible path prefix when hosted behind a reverse proxy.
+# Use an empty string when the API is served at the origin root.
+root_path = ""
+# Browser origins allowed to call the API. Defaults allow localhost and
+# common private LAN IPv4 origins, e.g. PelagiaView at http://192.168.x.y:5173.
+cors_allow_origin_regex = "https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]|10(?:\\.\\d{1,3}){3}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2})(?::\\d+)?"
+
+[oracle]
+# Oracle Builder's V2 orchestrator is the learned-inference endpoint. Select
+# sealed catalog artifact IDs; Pelagia retains workflow and data ownership.
+enabled = true
+base_url = "http://127.0.0.1:8110"
+default_mask_model = ""
+default_classification_model = ""
+api_token = null
+connect_timeout_seconds = 5.0
+read_timeout_seconds = 120.0
+max_items_per_request = 64
+max_payload_bytes = 33554432
+max_output_bytes_per_item = 33554432
+retry_attempts = 2
+
+[logging]
+# Core operational logs. This layer must work even when PostgreSQL is down.
+log_path = "./logs"
+file_name = "pelagia.log"
+# Options: DEBUG, INFO, WARNING, ERROR, CRITICAL.
+level = "INFO"
+console = true
+max_bytes = 10485760
+backup_count = 10
+# PostgreSQL operational events; workers drain expired rows in bounded batches at startup.
+high_frequency_retention_days = 7
+job_event_retention_days = 90
+routine_log_retention_days = 90
+important_log_retention_days = 365
+cleanup_interval_seconds = 300
+cleanup_batch_size = 50000
+
+[artifacts]
+# Local runtime library for plugin manifests and future non-ML packs.
+local_root = "./.pelagia"
+
+[artifacts.plugins]
+# Search packaged Pelagia/assets/plugins in addition to local_path.
+builtin_enabled = true
+# Local plugin manifests. Plugin execution/loading is intentionally future work.
+local_path = "./.pelagia/plugins"
+metadata_filename = "metadata.toml"

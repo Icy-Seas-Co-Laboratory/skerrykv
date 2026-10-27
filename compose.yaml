@@ -1,0 +1,18 @@
+services:
+  skerry:
+    build: .
+    restart: unless-stopped
+    environment:
+      SKERRY_MCP_ENABLED: ${SKERRY_MCP_ENABLED:-false}
+      SKERRY_TOKEN: ${SKERRY_TOKEN:?Set SKERRY_TOKEN before starting the container}
+    ports:
+      - "127.0.0.1:7788:7788"
+    volumes:
+      - skerry-data:/var/lib/skerry
+    healthcheck:
+      test: ["CMD", "skerry", "status", "--url", "http://127.0.0.1:7788"]
+      interval: 20s
+      timeout: 3s
+      retries: 3
+volumes:
+  skerry-data:

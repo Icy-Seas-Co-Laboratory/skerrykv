@@ -1,0 +1,62 @@
+# Paths are relative to this file. Tokens belong in SKERRY_TOKEN, never here.
+[server]
+listen = "127.0.0.1:7788"
+request_timeout_seconds = 120
+shutdown_timeout_seconds = 30
+
+[storage]
+root = "./data"
+
+[segments]
+max_size_bytes = 8589934592
+growth_factor = 1 # 2 enables geometric logical growth, not disk block reservation
+
+[writes]
+batch_max_records = 512
+batch_max_delay_ms = 1
+max_pending_mib = 256
+
+[reads]
+policy = "ssd" # or "hdd"
+max_concurrency = 32
+hdd_window_ms = 4
+queue_items = 1024
+
+[resources]
+max_object_mib = 64
+max_inflight_read_mib = 256
+max_open_segments = 256
+max_requests = 128
+max_batch_items = 4096
+
+[cache]
+payload_mib = 256 # 0 disables payload caching
+index_mib = 128
+admission_entries = 65536
+admission_window_seconds = 300
+
+[logging]
+level = "info" # RUST_LOG overrides this
+
+# MCP uses the same store/coordinators. Local anonymous access is read-only.
+# Scoped secrets: SKERRY_MCP_READ_TOKEN / WRITE_TOKEN / MAINTENANCE_TOKEN.
+[mcp]
+enabled = true
+http_path = "/mcp"
+read_only = true
+allow_verification = false
+max_inline_object_kib = 128
+max_put_object_kib = 128
+max_list_page_size = 100
+max_concurrent_requests = 16
+max_encoded_response_kib = 512
+max_response_memory_mib = 16
+max_request_kib = 256
+max_verification_jobs = 1
+max_retained_jobs = 64
+tool_timeout_seconds = 30
+verification_timeout_seconds = 300
+requests_per_minute = 120
+auth_gateway = false
+allowed_origins = [] # Empty rejects every present Origin; non-browser clients omit it.
+# external_url = "https://mcp.example.com/mcp" # Requires compatible OAuth gateway.

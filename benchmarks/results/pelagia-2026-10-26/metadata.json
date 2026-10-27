@@ -1,0 +1,40 @@
+{
+  "blake3": "1.0.9",
+  "cache_condition": "Explicit full read pass before each timed read phase; all data fits RAM; no OS cache eviction; no cold-cache or HDD claims.",
+  "completed": true,
+  "completed_cases": 141,
+  "completed_utc": "2026-10-26T23:37:41.918342+00:00",
+  "cpu": "Apple M3 Max",
+  "disk_free_bytes_start": 85985755136,
+  "durability_caveat": "KV2 current WAL NORMAL vs Skerry SyncAll; FULL+verify is benchmark-only sensitivity, not production KV2 behavior.",
+  "fixture_work_root": "/Users/tbkelly/Documents/GitHub/skerrykv/kv2-compare-ufdciu2t",
+  "load_average_start": [
+    2.837890625,
+    3.27978515625,
+    4.29296875
+  ],
+  "machine": "arm64",
+  "memory_bytes": "137438953472",
+  "os_posix_fallocate_available": false,
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.12.2 | packaged by conda-forge | (main, Feb 16 2024, 20:54:21) [Clang 16.0.6 ]",
+  "records": 1024,
+  "rss_scope": "whole child/family, including fixture preload, initialization and warmups; not backend-only memory",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "seed": 20261026,
+  "sources": {
+    "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/default.config.toml": "08036a509068598ee8ad9ad3401c7d68e42b7b580a038282185a4cf77d9f10ce",
+    "/Users/tbkelly/Documents/GitHub/Pelagia/Pelagia/storage/kvstore2.py": "7bf06f10e5c6a99a0053dac059367820545e85aeb9c60a5b92c1303e2e8c4351",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/Cargo.lock": "6568718c81fee3835976945cc7724e64f2705906bbdffdfeb27c0abe54a6d1d3",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/benchmarks/compare_pelagia.py": "9ccfc2e17dd737597ac944e1c219cadcf8d213efd8f6c5769544e6c71c2bd00c",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/examples/compare_kvstore2.rs": "cdd695bd8c65f986ee8c56f19f277036a7bf473a2e50e62e7215c30a49715b81",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/coordinator.rs": "b6cbf119292c9a47c25ec3635315b3ce347e7f9db17eb7b930d56297e55b8e5c",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/engine.rs": "715d57a1f0a5907a3932bc03f99970ec3500f3796c3729d0249ed305d5b5456f",
+    "/Users/tbkelly/Documents/GitHub/skerrykv/src/server.rs": "ff9f80c992785837936d93f47cf07ad7d2b3aad565c30dfdd4bc9fc046c797fe"
+  },
+  "sqlite": "3.45.3",
+  "sqlite_context_manager": "unmodified production connection lifetime; benchmark does not add explicit close or reuse",
+  "started_utc": "2026-10-26T23:10:15.196830+00:00",
+  "trials": 3,
+  "workers": 8
+}
