@@ -24,6 +24,13 @@ impl Mutation {
         }
     }
 }
+#[derive(Serialize, Deserialize)]
+struct ReplayCursor {
+    journal: String,
+    end: u64,
+}
+const RECOVERY_SPACE: &str = "recovery";
+
 pub(super) struct Journal {
     pub name: String,
     file: File,
@@ -49,6 +56,96 @@ impl Journal {
         };
         journal.visit(|_| Ok(()))?;
         Ok(journal)
+    }
+    // Normal open validates the durable receipt, not historical frames.
+    pub fn open_fast(root: &Path, name: &str) -> Result<Self> {
+        let journal = Self {
+            name: name.into(),
+            file: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(name))?,
+        };
+        journal.witness()?;
+        Ok(journal)
+    }
+    pub fn recover_index(
+        &self,
+        db: &Database,
+        objects: &Keyspace,
+        segments: &Keyspace,
+        tombstones: &Keyspace,
+        retired: &Keyspace,
+    ) -> Result<()> {
+        let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
+        let cursor = recovery
+            .get(b"cursor")?
+            .map(|value| serde_json::from_slice::<ReplayCursor>(&value))
+            .transpose()?;
+        let witness = self.witness()?;
+        let start = match cursor {
+            Some(cursor)
+                if cursor.journal == self.name
+                    && !witness.degraded
+                    && cursor.end <= witness.floor =>
+            {
+                ensure!(
+                    cursor.end >= JOURNAL_HEADER && cursor.end <= witness.floor,
+                    "index replay cursor is beyond the durable journal witness"
+                );
+                ensure!(
+                    recovery.contains_key(b"objects")?,
+                    "missing recovery object count"
+                );
+                cursor.end
+            }
+            _ => {
+                // Existing releases have no cursor. Reconstruct once, also used
+                // conservatively when a witness slot needs recovery.
+                self.replay(db, objects, segments, tombstones, retired)?;
+                let value = recovery.get(b"cursor")?.context("missing replay cursor")?;
+                serde_json::from_slice::<ReplayCursor>(&value)?.end
+            }
+        };
+        let end = self.visit_from(start, |changes, end| {
+            // Keep the receipt ahead of any persisted index cursor, including
+            // complete but previously unacknowledged post-witness frames.
+            if end > self.witness()?.floor {
+                let mut receipt = Self {
+                    name: self.name.clone(),
+                    file: self.file.try_clone()?,
+                };
+                receipt.write_witness(end)?;
+            }
+            apply(
+                db,
+                objects,
+                segments,
+                tombstones,
+                retired,
+                &changes,
+                Some((&self.name, end)),
+            )
+        })?;
+        if end != start {
+            db.persist(PersistMode::SyncAll)?;
+        }
+        let mut file = self.file.try_clone()?;
+        if file.metadata()?.len() != end {
+            file.set_len(end)?;
+            file.sync_all()?;
+        }
+        if witness.degraded || end > witness.floor {
+            // write_witness needs mutable access to a file handle only.
+            let mut journal = Self {
+                name: self.name.clone(),
+                file,
+            };
+            journal.write_witness(end)?;
+        } else {
+            file.seek(SeekFrom::End(0))?;
+        }
+        Ok(())
     }
     pub fn open(root: &Path, name: &str) -> Result<Self> {
         let mut journal = Self {
@@ -121,13 +218,20 @@ impl Journal {
         Ok(witness)
     }
     fn visit(&self, mut visit: impl FnMut(Vec<Mutation>) -> Result<()>) -> Result<u64> {
+        self.visit_from(JOURNAL_HEADER, |changes, _| visit(changes))
+    }
+    fn visit_from(
+        &self,
+        start: u64,
+        mut visit: impl FnMut(Vec<Mutation>, u64) -> Result<()>,
+    ) -> Result<u64> {
         let witness = self.witness()?;
         let degraded = witness.degraded;
         let witness = witness.floor;
         let mut file = self.file.try_clone()?;
-        file.seek(SeekFrom::Start(JOURNAL_HEADER))?;
+        file.seek(SeekFrom::Start(start))?;
         let length = file.metadata()?.len();
-        let mut offset = JOURNAL_HEADER;
+        let mut offset = start;
         while offset < length {
             // Only a short header/body is an incomplete transaction. A complete
             // frame with invalid CRC or marker is corruption, even at EOF.
@@ -138,6 +242,9 @@ impl Journal {
                 );
                 return Ok(offset);
             }
+            // try_clone shares the seek position; a recovery callback can
+            // update witness slots through another handle.
+            file.seek(SeekFrom::Start(offset))?;
             let mut header = [0; 20];
             file.read_exact(&mut header)?;
             ensure!(
@@ -171,8 +278,11 @@ impl Journal {
                     && crc32fast::hash(&body) == u32::from_le_bytes(tail[8..].try_into().unwrap()),
                 "mutation journal batch checksum/commit corruption at {offset}"
             );
-            visit(serde_json::from_slice(&body).context("invalid committed mutation batch")?)?;
             offset += 20 + size + 12;
+            visit(
+                serde_json::from_slice(&body).context("invalid committed mutation batch")?,
+                offset,
+            )?;
         }
         ensure!(
             !degraded || offset > witness,
@@ -231,7 +341,12 @@ impl Journal {
         tombstones: &Keyspace,
         retired: &Keyspace,
     ) -> Result<()> {
-        for space in [objects, segments, tombstones, retired] {
+        let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
+        // Invalidate the old cursor durably before any destructive rebuild.
+        // A process death during clearing must restart the full replay.
+        recovery.remove(b"cursor")?;
+        db.persist(PersistMode::SyncAll)?;
+        for space in [objects, segments, tombstones, retired, &recovery] {
             // A fresh iterator for each chunk avoids retaining the complete
             // namespace or an unbounded Fjall write batch in memory.
             loop {
@@ -248,7 +363,26 @@ impl Journal {
                 batch.commit()?;
             }
         }
-        self.visit(|changes| apply(db, objects, segments, tombstones, retired, &changes))?;
+        // Reset the count before replay, so each frame updates it atomically.
+        recovery.insert(b"objects", 0u64.to_le_bytes())?;
+        let end = self.visit_from(JOURNAL_HEADER, |changes, end| {
+            apply(
+                db,
+                objects,
+                segments,
+                tombstones,
+                retired,
+                &changes,
+                Some((&self.name, end)),
+            )
+        })?;
+        recovery.insert(
+            b"cursor",
+            serde_json::to_vec(&ReplayCursor {
+                journal: self.name.clone(),
+                end,
+            })?,
+        )?;
         db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
@@ -289,16 +423,36 @@ fn apply(
     tombstones: &Keyspace,
     retired: &Keyspace,
     changes: &[Mutation],
+    cursor: Option<(&str, u64)>,
 ) -> Result<()> {
+    let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
+    let mut count = match recovery.get(b"objects")? {
+        Some(value) => {
+            ensure!(value.len() == 8, "invalid recovery object count");
+            u64_at(&value, 0)
+        }
+        None => objects.len()? as u64,
+    };
+    let mut presence = HashMap::new();
     let mut batch = db.batch();
     for change in changes {
         match change {
             Mutation::Put { hash, location } => {
+                let present = *presence.entry(*hash).or_insert(objects.contains_key(hash)?);
+                if !present {
+                    count = count.checked_add(1).context("object count overflow")?;
+                }
+                presence.insert(*hash, true);
                 decode_loc(location)?;
                 batch.insert(objects, hash, location);
                 batch.remove(tombstones, hash);
             }
             Mutation::Delete { hash, timestamp } => {
+                let present = *presence.entry(*hash).or_insert(objects.contains_key(hash)?);
+                if present {
+                    count = count.checked_sub(1).context("object count underflow")?;
+                }
+                presence.insert(*hash, false);
                 batch.remove(objects, hash);
                 batch.insert(tombstones, hash, timestamp.to_le_bytes());
             }
@@ -313,17 +467,49 @@ fn apply(
             Mutation::Cleaned { id } => batch.remove(retired, id),
         }
     }
+    batch.insert(&recovery, b"objects", count.to_le_bytes());
+    if let Some((journal, end)) = cursor {
+        batch.insert(
+            &recovery,
+            b"cursor",
+            serde_json::to_vec(&ReplayCursor {
+                journal: journal.into(),
+                end,
+            })?,
+        );
+    }
     batch.commit()?;
     Ok(())
 }
 impl Store {
+    pub(super) fn startup_object_count(&self) -> Result<u64> {
+        let recovery = self
+            .db
+            .keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
+        if let Some(value) = recovery.get(b"objects")? {
+            ensure!(value.len() == 8, "invalid recovery object count");
+            return Ok(u64_at(&value, 0));
+        }
+        // Legacy v1 indexes need one metadata-only count migration.
+        let count = self.objects.len()? as u64;
+        recovery.insert(b"objects", count.to_le_bytes())?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(count)
+    }
     pub(super) fn publish(&self, changes: &[Mutation]) -> Result<()> {
         if changes.is_empty() {
             return Ok(());
         }
-        if let Some(journal) = &self.journal {
-            journal.lock().append(changes)?;
+        let mut journal = self.journal.as_ref().map(|journal| journal.lock());
+        if let Some(journal) = &mut journal {
+            journal.append(changes)?;
         }
+        let cursor = journal
+            .as_ref()
+            .map(|journal| {
+                Ok::<_, anyhow::Error>((journal.name.as_str(), journal.file.metadata()?.len()))
+            })
+            .transpose()?;
         apply(
             &self.db,
             &self.objects,
@@ -331,6 +517,7 @@ impl Store {
             &self.tombstones,
             &self.retired,
             changes,
+            cursor,
         )?;
         failpoint("after_index_commit")?;
         self.db.persist(PersistMode::SyncAll)?;
@@ -1415,6 +1602,108 @@ pub(super) fn verify_v2(config: &Config) -> Result<Value> {
 #[cfg(test)]
 mod witness_tests {
     use super::*;
+
+    #[test]
+    fn startup_replays_only_unapplied_mutations_and_keeps_exact_count() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let hash = store
+            .put_many(&[Bytes::from_static(b"pending delete")])
+            .unwrap()[0]
+            .hash;
+        let loc = decode_loc(&store.objects.get(hash).unwrap().unwrap()).unwrap();
+        let id = Uuid::from_bytes(loc.segment);
+        let mut meta =
+            decode_meta(id, &store.segments.get(id.as_bytes()).unwrap().unwrap()).unwrap();
+        meta.live = 0;
+        meta.garbage_since = now();
+        let mut previous_receipts = [0; JOURNAL_HEADER as usize];
+        read_exact_at(
+            &store.journal.as_ref().unwrap().lock().file,
+            &mut previous_receipts,
+            0,
+        )
+        .unwrap();
+        // Synchronized transactions whose receipt/index publication was interrupted.
+        store
+            .journal
+            .as_ref()
+            .unwrap()
+            .lock()
+            .append(&[
+                Mutation::Delete {
+                    hash,
+                    timestamp: now(),
+                },
+                Mutation::segment(&meta),
+            ])
+            .unwrap();
+        {
+            let mut journal = store.journal.as_ref().unwrap().lock();
+            journal
+                .append(&[Mutation::Delete {
+                    hash: [42; 32],
+                    timestamp: now(),
+                }])
+                .unwrap();
+            journal.file.seek(SeekFrom::Start(0)).unwrap();
+            journal.file.write_all(&previous_receipts).unwrap();
+            journal.file.sync_all().unwrap();
+        }
+        drop(store);
+        let store = Store::open(&config).unwrap();
+        assert!(store.get(&hash).unwrap().is_none());
+        assert_eq!(store.status().unwrap().objects, 0);
+        let results = store
+            .put_many(&[
+                Bytes::from_static(b"pending delete"),
+                Bytes::from_static(b"pending delete"),
+            ])
+            .unwrap();
+        assert_eq!(results[0].hash, hash);
+        assert_eq!(store.status().unwrap().objects, 1);
+        drop(store);
+        let store = Store::open(&config).unwrap();
+        assert_eq!(store.status().unwrap().objects, 1);
+        drop(store);
+        Store::verify(&config).unwrap();
+    }
+
+    #[test]
+    fn missing_cursor_rebuilds_once_and_clean_open_skips_historical_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let hash = store.put_many(&[Bytes::from_static(b"preserved")]).unwrap()[0].hash;
+        let recovery = store
+            .db
+            .keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)
+            .unwrap();
+        recovery.remove(b"cursor").unwrap();
+        store.objects.remove(hash).unwrap();
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        drop(recovery);
+        drop(store);
+        let store = Store::open(&config).unwrap();
+        assert_eq!(store.get(&hash).unwrap().unwrap(), b"preserved");
+        assert_eq!(store.status().unwrap().objects, 1);
+        let journal_name = store.journal.as_ref().unwrap().lock().name.clone();
+        drop(store);
+        // History already represented by the durable cursor is not rescanned.
+        // Explicit verify still detects journal bit rot.
+        let path = config.storage.root.join(journal_name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[JOURNAL_HEADER as usize + 20] ^= 1;
+        fs::write(&path, bytes).unwrap();
+        let store = Store::open(&config).unwrap();
+        assert_eq!(store.get(&hash).unwrap().unwrap(), b"preserved");
+        assert_eq!(store.status().unwrap().objects, 1);
+        drop(store);
+        assert!(Store::verify(&config).is_err());
+    }
 
     fn torn_latest_witness(journal: &mut Journal) -> (u64, u64) {
         journal

@@ -188,12 +188,27 @@ infer liveness from physical records: doing so could resurrect a deleted object.
 
 ## Recovery, rebuilding, and import
 
-Normal startup obtains the store lock and validates all indexed committed data
-and every object mapping. Truncation, corrupt payloads, missing referenced files,
-and inconsistent metadata are errors. Active trailing bytes are excluded and
-truncated. A fully synchronized, valid interrupted seal is reconciled. Unknown
+Normal startup obtains the store lock and opens from persisted index metadata.
+The index's `recovery` keyspace holds the journal identity/end cursor and exact
+live object count. Each cursor/count update shares the same atomic Fjall batch as
+its namespace mutations, and is synchronized before acknowledgment. Startup reads
+the durable witness and replays only frames after that cursor. Journal history
+already represented in the index is not read or checksum-verified at startup.
+An older index without a matching cursor is reconstructed from the journal once;
+a degraded witness also takes the conservative full-journal recovery path.
+Legacy v1 indexes need a one-time object-count metadata scan.
+
+Startup checks referenced segment headers, lengths and footer metadata, without
+scanning records, object mappings, or hashing segment contents. Missing files and
+truncated committed data are errors. Payload corruption is detected by verified
+reads or explicit `verify`, which retains full journal, record and sealed-digest
+validation. Active trailing bytes are excluded and truncated. An interrupted seal
+is reconciled using its header/footer identity and count/end metadata. Unknown
 unreferenced `.seg` files remain untouched with a warning; `verify` reports them.
-Unpublished `.import-*.tmp` files are removed during normal recovery.
+Unpublished `.import-*.tmp` files are removed during normal recovery. Thus ordinary
+open work scales with segment metadata and unapplied journal transactions, not
+stored payload bytes or total object count. Fjall still performs its own database
+open/crash recovery.
 
 For v2, rebuilding replays the selected journal into a new generation and validates
 referenced segment prefixes, including committed active records. For v1, strict

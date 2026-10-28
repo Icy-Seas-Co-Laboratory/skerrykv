@@ -172,21 +172,41 @@ fn verifies_without_truncation_then_recovers_incomplete_tail() {
     assert_eq!(store.get(&h).unwrap().unwrap(), b"committed");
 }
 #[test]
-fn committed_payload_and_header_corruption_fail_closed() {
+fn committed_payload_and_header_corruption_detected_on_read_and_verify() {
     for offset in [64 + 60, 128] {
         let d = TempDir::new().unwrap();
         let c = config(&d);
         let store = Store::open(&c).unwrap();
-        store.put_many(&[Bytes::from_static(b"committed")]).unwrap();
+        let h = store.put_many(&[Bytes::from_static(b"committed")]).unwrap()[0].hash;
         drop(store);
         let p = files(&c).remove(0);
         let mut f = OpenOptions::new().write(true).open(&p).unwrap();
         f.seek(SeekFrom::Start(offset)).unwrap();
         f.write_all(&[0x85]).unwrap();
         drop(f);
-        assert!(Store::open(&c).is_err());
+        let store = Store::open(&c).unwrap();
+        assert!(store.get(&h).is_err());
+        drop(store);
         assert!(engine::verify(&c).is_err());
     }
+}
+#[test]
+fn sealed_payload_corruption_is_detected_on_read_and_verify() {
+    let d = TempDir::new().unwrap();
+    let c = config(&d);
+    let store = Store::open(&c).unwrap();
+    let h = store.put_many(&[Bytes::from_static(b"committed")]).unwrap()[0].hash;
+    store.seal().unwrap();
+    drop(store);
+    let p = files(&c).remove(0);
+    let mut f = OpenOptions::new().write(true).open(&p).unwrap();
+    f.seek(SeekFrom::Start(128)).unwrap();
+    f.write_all(&[0x85]).unwrap();
+    drop(f);
+    let store = Store::open(&c).unwrap();
+    assert!(store.get(&h).is_err());
+    drop(store);
+    assert!(engine::verify(&c).is_err());
 }
 #[test]
 fn truncated_committed_record_is_not_silently_repaired() {

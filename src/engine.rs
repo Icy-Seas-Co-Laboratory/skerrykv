@@ -794,7 +794,7 @@ impl Store {
                 .filter(|a| a.version == 2)
                 .map(|a| {
                     if repair {
-                        Journal::open(&root, a.journal.as_deref().unwrap())
+                        Journal::open_fast(&root, a.journal.as_deref().unwrap())
                     } else {
                         Journal::read_only(&root, a.journal.as_deref().unwrap())
                     }
@@ -802,7 +802,7 @@ impl Store {
                 .transpose()?
         };
         if repair && let Some(journal) = &journal {
-            journal.replay(&db, &objects, &segments, &tombstones, &retired)?;
+            journal.recover_index(&db, &objects, &segments, &tombstones, &retired)?;
         }
         if new {
             db.persist(PersistMode::SyncAll)?;
@@ -874,25 +874,27 @@ impl Store {
                 physical >= meta.end,
                 "committed data truncated in segment {id}"
             );
-            let mut live = 0u64;
-            let (count, end) =
-                scan_prefix_visit(&mut file, id, meta.end, false, &mut |hash, loc| {
-                    if let Some(v) = self.objects.get(hash)?
-                        && decode_loc(&v)? == loc
-                    {
-                        object_count += 1;
-                        live += loc.length;
-                    }
-                    Ok(())
-                })?;
-            ensure!(
-                end == meta.end && count == meta.count,
-                "committed segment count/end mismatch"
-            );
-            ensure!(
-                live == meta.live,
-                "segment live-byte metadata mismatch for {id}"
-            );
+            if !repair {
+                let mut live = 0u64;
+                let (count, end) =
+                    scan_prefix_visit(&mut file, id, meta.end, false, &mut |hash, loc| {
+                        if let Some(v) = self.objects.get(hash)?
+                            && decode_loc(&v)? == loc
+                        {
+                            object_count += 1;
+                            live += loc.length;
+                        }
+                        Ok(())
+                    })?;
+                ensure!(
+                    end == meta.end && count == meta.count,
+                    "committed segment count/end mismatch"
+                );
+                ensure!(
+                    live == meta.live,
+                    "segment live-byte metadata mismatch for {id}"
+                );
+            }
             if meta.state == 1 {
                 ensure!(
                     physical == meta.end + 96 && meta.physical == physical,
@@ -911,7 +913,7 @@ impl Store {
                     "sealed segment metadata mismatch"
                 );
                 ensure!(
-                    digest_prefix(&mut file, meta.end)? == f.digest,
+                    repair || digest_prefix(&mut file, meta.end)? == f.digest,
                     "sealed segment digest mismatch"
                 );
             } else {
@@ -926,7 +928,7 @@ impl Store {
                             "interrupted seal footer mismatch"
                         );
                         ensure!(
-                            digest_prefix(&mut file, meta.end)? == f.digest,
+                            repair || digest_prefix(&mut file, meta.end)? == f.digest,
                             "interrupted seal digest mismatch"
                         );
                         meta.state = 1;
@@ -957,17 +959,22 @@ impl Store {
                 }
             }
         }
-        let mut indexed = 0u64;
-        for item in self.objects.iter() {
-            let (k, v) = item.into_inner()?;
-            ensure!(k.len() == 32, "invalid hash index key");
-            decode_loc(&v)?;
-            indexed += 1;
+        if !repair {
+            let mut indexed = 0u64;
+            for item in self.objects.iter() {
+                let (k, v) = item.into_inner()?;
+                ensure!(k.len() == 32, "invalid hash index key");
+                decode_loc(&v)?;
+                indexed += 1;
+            }
+            ensure!(
+                indexed == object_count,
+                "object index contains missing segments or invalid record locations"
+            );
         }
-        ensure!(
-            indexed == object_count,
-            "object index contains missing segments or invalid record locations"
-        );
+        if repair {
+            object_count = self.startup_object_count()?;
+        }
         self.object_count.store(object_count, Ordering::Relaxed);
         if repair {
             for p in segment_files(&self.root)? {

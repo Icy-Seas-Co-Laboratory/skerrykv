@@ -40,13 +40,14 @@ Sealing requires all records to be committed. The writer truncates unused logica
 
 | Interruption | Startup action |
 |---|---|
-| Partial append or fully written unindexed record | Validate committed prefix, truncate active tail |
+| Partial append or fully written unindexed record | Check committed length metadata, truncate active tail |
 | Segment synchronized before index commit | Same; never promote the tail in normal recovery |
 | Journal synchronized before index publication | Replay the committed v2 batch; payload was synchronized first |
 | Durable commit before response | Object may exist; retry deduplicates |
 | Partial seal footer | Truncate to indexed committed end and resume |
-| Valid synchronized footer, index still active | Validate identity/count/end/digest against metadata, finish sealing |
-| Committed payload corruption/missing segment | Fail startup; no automatic truncation of committed data |
+| Valid synchronized footer, index still active | Check footer identity/count/end/digest fields against metadata, finish sealing |
+| Committed payload corruption | Detect on GET or explicit verify; no full startup scan |
+| Missing segment/truncated committed data | Fail startup; no automatic truncation of committed data |
 
 Fault injection covers record header/payload writes, segment synchronization, index commit/persistence, acknowledgment, footer boundaries, activation, and import publication. These process-level tests validate protocol recovery; hardware power-loss behavior remains an external validation requirement.
 
