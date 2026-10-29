@@ -17,6 +17,22 @@ pub struct ProgressSnapshot {
     pub segments_total: Option<u64>,
     pub journal_bytes: u64,
     pub transactions_processed: u64,
+    #[serde(default)]
+    pub recovery_mode: Option<String>,
+    #[serde(default)]
+    pub recovery_reason: Option<String>,
+    #[serde(default)]
+    pub index_keyspace: Option<String>,
+    #[serde(default)]
+    pub index_entries_cleared: u64,
+    #[serde(default)]
+    pub journal_bytes_total: Option<u64>,
+    #[serde(default)]
+    pub journal_bytes_remaining: Option<u64>,
+    #[serde(default)]
+    pub journal_bytes_per_second: f64,
+    #[serde(default)]
+    pub journal_eta_seconds: Option<f64>,
     pub index_entries_compared: u64,
     pub index_bytes_copied: u64,
     pub elapsed_seconds: f64,
@@ -30,6 +46,12 @@ struct Detail {
     segments_total: Option<u64>,
     finished: Option<Instant>,
     failures: Vec<String>,
+    recovery_mode: Option<String>,
+    recovery_reason: Option<String>,
+    index_keyspace: Option<String>,
+    journal_total: Option<u64>,
+    journal_started: Option<Instant>,
+    journal_finished: Option<Instant>,
 }
 pub struct Progress {
     started: Instant,
@@ -43,6 +65,7 @@ pub struct Progress {
     transactions: AtomicU64,
     index_entries: AtomicU64,
     index_bytes: AtomicU64,
+    entries_cleared: AtomicU64,
     cancelled: AtomicBool,
 }
 impl Default for Progress {
@@ -61,6 +84,12 @@ impl Progress {
                 segments_total: None,
                 finished: None,
                 failures: vec![],
+                recovery_mode: None,
+                recovery_reason: None,
+                index_keyspace: None,
+                journal_total: None,
+                journal_started: None,
+                journal_finished: None,
             }),
             bytes: AtomicU64::new(0),
             verified_bytes: AtomicU64::new(0),
@@ -71,7 +100,35 @@ impl Progress {
             transactions: AtomicU64::new(0),
             index_entries: AtomicU64::new(0),
             index_bytes: AtomicU64::new(0),
+            entries_cleared: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+        }
+    }
+    pub fn recovery(&self, mode: &str, reason: &str) {
+        let mut detail = self.detail.lock();
+        detail.recovery_mode = Some(mode.into());
+        detail.recovery_reason = Some(reason.into());
+    }
+    pub fn clearing_keyspace(&self, keyspace: &str) {
+        self.phase("clearing index");
+        self.detail.lock().index_keyspace = Some(keyspace.into());
+    }
+    pub fn add_cleared_entries(&self, count: u64) {
+        self.entries_cleared.fetch_add(count, Ordering::Relaxed);
+    }
+    pub fn begin_journal(&self, total: u64) {
+        self.phase("replaying journal");
+        let mut detail = self.detail.lock();
+        detail.index_keyspace = None;
+        detail.journal_total = Some(total);
+        detail.journal_started = Some(Instant::now());
+        detail.journal_finished = None;
+    }
+    pub fn finish_journal(&self) {
+        let mut detail = self.detail.lock();
+        detail.journal_total = Some(self.journal_bytes.load(Ordering::Relaxed));
+        if detail.journal_started.is_some() && detail.journal_finished.is_none() {
+            detail.journal_finished = Some(Instant::now());
         }
     }
     pub fn phase(&self, phase: &str) {
@@ -159,6 +216,21 @@ impl Progress {
             .duration_since(self.started)
             .as_secs_f64();
         let bytes = self.bytes.load(Ordering::Relaxed);
+        let journal_bytes = self.journal_bytes.load(Ordering::Relaxed);
+        let journal_elapsed = detail.journal_started.map(|start| {
+            detail
+                .journal_finished
+                .or(detail.finished)
+                .unwrap_or_else(Instant::now)
+                .saturating_duration_since(start)
+                .as_secs_f64()
+        });
+        let journal_rate = journal_elapsed
+            .filter(|elapsed| *elapsed > 0.0)
+            .map_or(0.0, |elapsed| journal_bytes as f64 / elapsed);
+        let journal_remaining = detail
+            .journal_total
+            .map(|total| total.saturating_sub(journal_bytes));
         ProgressSnapshot {
             state: detail.state.clone(),
             phase: detail.phase.clone(),
@@ -171,6 +243,18 @@ impl Progress {
             segments_total: detail.segments_total,
             journal_bytes: self.journal_bytes.load(Ordering::Relaxed),
             transactions_processed: self.transactions.load(Ordering::Relaxed),
+            recovery_mode: detail.recovery_mode.clone(),
+            recovery_reason: detail.recovery_reason.clone(),
+            index_keyspace: detail.index_keyspace.clone(),
+            index_entries_cleared: self.entries_cleared.load(Ordering::Relaxed),
+            journal_bytes_total: detail.journal_total,
+            journal_bytes_remaining: journal_remaining,
+            journal_bytes_per_second: journal_rate,
+            journal_eta_seconds: if journal_rate > 0.0 {
+                journal_remaining.map(|remaining| remaining as f64 / journal_rate)
+            } else {
+                None
+            },
             index_entries_compared: self.index_entries.load(Ordering::Relaxed),
             index_bytes_copied: self.index_bytes.load(Ordering::Relaxed),
             elapsed_seconds: elapsed,
@@ -186,6 +270,45 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_stages_report_clearing_and_journal_progress_separately() {
+        let p = Progress::new();
+        p.recovery("full", "missing_cursor");
+        p.clearing_keyspace("objects");
+        p.add_cleared_entries(1024);
+        let clearing = p.snapshot();
+        assert_eq!(clearing.phase, "clearing index");
+        assert_eq!(clearing.index_keyspace.as_deref(), Some("objects"));
+        assert_eq!(clearing.index_entries_cleared, 1024);
+        assert_eq!(clearing.journal_bytes_total, None);
+        p.begin_journal(1000);
+        p.add_journal_bytes(400);
+        p.add_transactions(2);
+        let replay = p.snapshot();
+        assert_eq!(replay.index_keyspace, None);
+        assert_eq!(replay.journal_bytes_remaining, Some(600));
+        assert!(replay.journal_bytes_per_second > 0.0);
+        assert!(replay.journal_eta_seconds.unwrap() >= 0.0);
+        p.finish_journal();
+        assert_eq!(p.snapshot().journal_bytes_remaining, Some(0));
+        let encoded = serde_json::to_value(p.snapshot()).unwrap();
+        let mut old = encoded.as_object().unwrap().clone();
+        for key in [
+            "recovery_mode",
+            "recovery_reason",
+            "index_keyspace",
+            "index_entries_cleared",
+            "journal_bytes_total",
+            "journal_bytes_remaining",
+            "journal_bytes_per_second",
+            "journal_eta_seconds",
+        ] {
+            old.remove(key);
+        }
+        let decoded: ProgressSnapshot =
+            serde_json::from_value(serde_json::Value::Object(old)).unwrap();
+        assert_eq!(decoded.index_entries_cleared, 0);
+    }
     #[test]
     fn terminal_state_freezes_elapsed_and_preserves_counters() {
         let p = Progress::new();

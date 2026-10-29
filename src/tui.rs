@@ -303,7 +303,27 @@ fn render_tab(
                 field(startup, "bytes_scanned"),
                 field(startup, "bytes_total")
             ),
-            format!("Journal bytes: {}", field(startup, "journal_bytes")),
+            format!(
+                "Recovery: {} ({})",
+                field(startup, "recovery_mode"),
+                field(startup, "recovery_reason")
+            ),
+            format!(
+                "Clearing keyspace: {}; entries cleared: {}",
+                field(startup, "index_keyspace"),
+                field(startup, "index_entries_cleared")
+            ),
+            format!(
+                "Journal bytes: {} / {}; remaining: {}",
+                field(startup, "journal_bytes"),
+                field(startup, "journal_bytes_total"),
+                field(startup, "journal_bytes_remaining")
+            ),
+            format!(
+                "Journal bytes/s: {}; ETA seconds: {}",
+                field(startup, "journal_bytes_per_second"),
+                field(startup, "journal_eta_seconds")
+            ),
             format!(
                 "Transactions processed: {}",
                 field(startup, "transactions_processed")

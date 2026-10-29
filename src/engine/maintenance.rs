@@ -102,9 +102,39 @@ impl Journal {
                     recovery.contains_key(b"objects")?,
                     "missing recovery object count"
                 );
+                if let Some(p) = progress {
+                    p.recovery("incremental", "valid_cursor");
+                    tracing::info!(
+                        mode = "incremental",
+                        reason = "valid_cursor",
+                        "journal recovery selected"
+                    );
+                }
                 cursor.end
             }
-            _ => {
+            cursor => {
+                if let Some(p) = progress {
+                    p.recovery(
+                        "full",
+                        if witness.degraded {
+                            "degraded_witness"
+                        } else if let Some(cursor) = &cursor {
+                            if cursor.journal != self.name {
+                                "journal_changed"
+                            } else {
+                                "cursor_ahead_of_witness"
+                            }
+                        } else {
+                            "missing_cursor"
+                        },
+                    );
+                    let snapshot = p.snapshot();
+                    tracing::info!(
+                        mode = "full",
+                        reason = snapshot.recovery_reason.as_deref().unwrap_or("unknown"),
+                        "journal recovery selected"
+                    );
+                }
                 // Existing releases have no cursor. Reconstruct once, also used
                 // conservatively when a witness slot needs recovery.
                 self.replay_with_progress(db, objects, segments, tombstones, retired, progress)?;
@@ -112,6 +142,11 @@ impl Journal {
                 serde_json::from_slice::<ReplayCursor>(&value)?.end
             }
         };
+        if let Some(p) = progress
+            && p.snapshot().recovery_mode.as_deref() == Some("incremental")
+        {
+            p.begin_journal(self.file.metadata()?.len().saturating_sub(start));
+        }
         let mut previous_end = start;
         let end = self.visit_from(start, |changes, end| {
             if let Some(p) = progress {
@@ -143,7 +178,14 @@ impl Journal {
             Ok(())
         })?;
         if end != start {
+            if let Some(p) = progress {
+                p.phase("synchronizing recovered index");
+            }
             db.persist(PersistMode::SyncAll)?;
+        }
+        if let Some(p) = progress {
+            p.finish_journal();
+            p.phase("finalizing journal recovery");
         }
         let mut file = self.file.try_clone()?;
         if file.metadata()?.len() != end {
@@ -373,19 +415,42 @@ impl Journal {
         let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
         // Invalidate the old cursor durably before any destructive rebuild.
         // A process death during clearing must restart the full replay.
+        if let Some(p) = progress {
+            p.phase("synchronizing recovery metadata");
+        }
         recovery.remove(b"cursor")?;
         db.persist(PersistMode::SyncAll)?;
-        for space in [objects, segments, tombstones, retired, &recovery] {
-            // A fresh iterator for each chunk avoids retaining the complete
-            // namespace or an unbounded Fjall write batch in memory.
+        for (name, space) in [
+            ("objects", objects),
+            ("segments", segments),
+            ("tombstones", tombstones),
+            ("retired", retired),
+            ("recovery", &recovery),
+        ] {
+            if let Some(p) = progress {
+                p.clearing_keyspace(name);
+                tracing::info!(keyspace = name, "clearing recovery index keyspace");
+            }
+            let mut cleared = 0u64;
+            // Resume strictly beyond the last deleted key. Restarting at the
+            // beginning repeatedly walks an ever-growing tombstone prefix.
+            let mut cursor: Option<Vec<u8>> = None;
             loop {
                 if let Some(p) = progress {
                     ensure!(!p.is_cancelled(), "startup cancelled");
                 }
                 let mut batch = db.batch();
                 let mut count = 0;
-                for item in space.iter().take(1024) {
+                let lower = cursor.as_ref().map_or(std::ops::Bound::Unbounded, |key| {
+                    std::ops::Bound::Excluded(key.clone())
+                });
+                let mut next = None;
+                for item in space
+                    .range::<Vec<u8>, _>((lower, std::ops::Bound::Unbounded))
+                    .take(1024)
+                {
                     let (key, _) = item.into_inner()?;
+                    next = Some(key.to_vec());
                     batch.remove(space, key);
                     count += 1;
                 }
@@ -393,7 +458,26 @@ impl Journal {
                     break;
                 }
                 batch.commit()?;
+                cursor = next;
+                cleared += count;
+                if let Some(p) = progress {
+                    p.add_cleared_entries(count);
+                }
             }
+            if progress.is_some() {
+                tracing::info!(
+                    keyspace = name,
+                    entries_cleared = cleared,
+                    "recovery index keyspace cleared"
+                );
+            }
+        }
+        if let Some(p) = progress {
+            tracing::info!(
+                journal_bytes = self.file.metadata()?.len().saturating_sub(JOURNAL_HEADER),
+                "replaying mutation journal"
+            );
+            p.begin_journal(self.file.metadata()?.len().saturating_sub(JOURNAL_HEADER));
         }
         // Reset the count before replay, so each frame updates it atomically.
         recovery.insert(b"objects", 0u64.to_le_bytes())?;
@@ -426,7 +510,13 @@ impl Journal {
                 end,
             })?,
         )?;
+        if let Some(p) = progress {
+            p.phase("synchronizing recovered index");
+        }
         db.persist(PersistMode::SyncAll)?;
+        if let Some(p) = progress {
+            p.finish_journal();
+        }
         Ok(())
     }
 }
@@ -2405,6 +2495,62 @@ mod witness_tests {
         assert_eq!(store.status().unwrap().objects, 1);
         drop(store);
         assert!(Store::verify(&config).is_err());
+    }
+
+    #[test]
+    fn full_recovery_clears_multiple_pages_in_every_keyspace_and_reports_work() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let recovery = store
+            .db
+            .keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)
+            .unwrap();
+        recovery.remove(b"cursor").unwrap();
+        // Stale index contents are deliberately invalid: full recovery must
+        // remove every page before rebuilding from the empty authority journal.
+        let mut expected = 1u64; // persisted recovery object count
+        for (space, count) in [
+            (&store.objects, 5000u32),
+            (&store.segments, 2049),
+            (&store.tombstones, 2049),
+            (&store.retired, 2049),
+        ] {
+            let mut batch = store.db.batch();
+            for key in 0..count {
+                batch.insert(space, key.to_be_bytes(), [1u8]);
+            }
+            batch.commit().unwrap();
+            expected += u64::from(count);
+        }
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        drop(recovery);
+        drop(store);
+        let progress = Arc::new(crate::progress::Progress::new());
+        let store = Store::open_with_progress(&config, &progress).unwrap();
+        for space in [
+            &store.objects,
+            &store.segments,
+            &store.tombstones,
+            &store.retired,
+        ] {
+            assert!(space.is_empty().unwrap());
+        }
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.recovery_mode.as_deref(), Some("full"));
+        assert_eq!(snapshot.recovery_reason.as_deref(), Some("missing_cursor"));
+        assert_eq!(snapshot.index_entries_cleared, expected);
+        assert_eq!(snapshot.journal_bytes_remaining, Some(0));
+        assert_eq!(snapshot.index_keyspace, None);
+        drop(store);
+        let next = Arc::new(crate::progress::Progress::new());
+        drop(Store::open_with_progress(&config, &next).unwrap());
+        assert_eq!(
+            next.snapshot().recovery_mode.as_deref(),
+            Some("incremental")
+        );
+        assert_eq!(next.snapshot().index_entries_cleared, 0);
     }
 
     fn torn_latest_witness(journal: &mut Journal) -> (u64, u64) {

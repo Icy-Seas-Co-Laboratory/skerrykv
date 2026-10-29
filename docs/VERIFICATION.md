@@ -106,3 +106,6 @@ engine-level probe with 500 verified reads overlapping a rate-limited scan; it
 excludes HTTP, Coordinator queueing, and MCP overhead. It is a small cache-warm
 sample, not evidence about cold HDD performance or sustained production latency.
 Reproduce it with `cargo run --release --example verification_foreground`.
+
+Recovery mode, clearing counters, journal-specific throughput and server upgrade
+instructions are described in [the 0.2.2 recovery fix](RECOVERY_UPDATE.md).
