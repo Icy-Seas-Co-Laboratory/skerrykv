@@ -49,7 +49,7 @@ impl Service {
                 panic!("service exited early: {exit}");
             }
             if client
-                .get(format!("{}/v1/health", self.url))
+                .get(format!("{}/v1/ready", self.url))
                 .send()
                 .await
                 .is_ok_and(|r| r.status().is_success())
@@ -385,7 +385,7 @@ try:
     end=time.monotonic()+10
     while True:
         try:
-            urllib.request.urlopen(url+'/v1/health',timeout=.2).read();break
+            urllib.request.urlopen(url+'/v1/ready',timeout=.2).read();break
         except Exception:
             if time.monotonic()>end:raise RuntimeError('embedded service not healthy')
             if p.poll() is not None:raise RuntimeError('embedded service exited')
@@ -470,7 +470,7 @@ async fn returned_persistence_failure_faults_writer_until_recovery() {
     assert!(!failed.status().is_success());
     assert_eq!(
         client
-            .get(format!("{}/v1/health", server.url))
+            .get(format!("{}/v1/ready", server.url))
             .send()
             .await
             .unwrap()

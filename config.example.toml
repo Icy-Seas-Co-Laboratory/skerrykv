@@ -73,3 +73,8 @@ requests_per_minute = 120
 auth_gateway = false
 allowed_origins = [] # Empty rejects every present Origin; non-browser clients omit it.
 # external_url = "https://mcp.example.com/mcp" # Requires compatible OAuth gateway.
+
+# Shared limits for online and offline integrity scans.
+[verification]
+max_concurrency = 1 # Sequential by default to reduce HDD seek pressure.
+max_bytes_per_second_mib = 0 # Zero means unlimited; applies to scan reads.

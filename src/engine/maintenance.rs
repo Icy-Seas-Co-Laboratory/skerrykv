@@ -76,7 +76,12 @@ impl Journal {
         segments: &Keyspace,
         tombstones: &Keyspace,
         retired: &Keyspace,
+        progress: Option<&crate::progress::Progress>,
     ) -> Result<()> {
+        if let Some(p) = progress {
+            p.phase("recovering journal");
+            ensure!(!p.is_cancelled(), "startup cancelled");
+        }
         let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
         let cursor = recovery
             .get(b"cursor")?
@@ -102,12 +107,16 @@ impl Journal {
             _ => {
                 // Existing releases have no cursor. Reconstruct once, also used
                 // conservatively when a witness slot needs recovery.
-                self.replay(db, objects, segments, tombstones, retired)?;
+                self.replay_with_progress(db, objects, segments, tombstones, retired, progress)?;
                 let value = recovery.get(b"cursor")?.context("missing replay cursor")?;
                 serde_json::from_slice::<ReplayCursor>(&value)?.end
             }
         };
+        let mut previous_end = start;
         let end = self.visit_from(start, |changes, end| {
+            if let Some(p) = progress {
+                ensure!(!p.is_cancelled(), "startup cancelled");
+            }
             // Keep the receipt ahead of any persisted index cursor, including
             // complete but previously unacknowledged post-witness frames.
             if end > self.witness()?.floor {
@@ -124,8 +133,14 @@ impl Journal {
                 tombstones,
                 retired,
                 &changes,
-                Some((&self.name, end)),
-            )
+                ApplyMode::Durable(Some((&self.name, end))),
+            )?;
+            if let Some(p) = progress {
+                p.add_journal_bytes(end - previous_end);
+                p.add_transactions(1);
+            }
+            previous_end = end;
+            Ok(())
         })?;
         if end != start {
             db.persist(PersistMode::SyncAll)?;
@@ -341,6 +356,20 @@ impl Journal {
         tombstones: &Keyspace,
         retired: &Keyspace,
     ) -> Result<()> {
+        self.replay_with_progress(db, objects, segments, tombstones, retired, None)
+    }
+    fn replay_with_progress(
+        &self,
+        db: &Database,
+        objects: &Keyspace,
+        segments: &Keyspace,
+        tombstones: &Keyspace,
+        retired: &Keyspace,
+        progress: Option<&crate::progress::Progress>,
+    ) -> Result<()> {
+        if let Some(p) = progress {
+            ensure!(!p.is_cancelled(), "startup cancelled");
+        }
         let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
         // Invalidate the old cursor durably before any destructive rebuild.
         // A process death during clearing must restart the full replay.
@@ -350,6 +379,9 @@ impl Journal {
             // A fresh iterator for each chunk avoids retaining the complete
             // namespace or an unbounded Fjall write batch in memory.
             loop {
+                if let Some(p) = progress {
+                    ensure!(!p.is_cancelled(), "startup cancelled");
+                }
                 let mut batch = db.batch();
                 let mut count = 0;
                 for item in space.iter().take(1024) {
@@ -365,7 +397,12 @@ impl Journal {
         }
         // Reset the count before replay, so each frame updates it atomically.
         recovery.insert(b"objects", 0u64.to_le_bytes())?;
+        let mut previous_end = JOURNAL_HEADER;
         let end = self.visit_from(JOURNAL_HEADER, |changes, end| {
+            if let Some(p) = progress {
+                ensure!(!p.is_cancelled(), "startup cancelled");
+            }
+            // Keep the cursor absent until the entire reconstruction succeeds.
             apply(
                 db,
                 objects,
@@ -373,8 +410,14 @@ impl Journal {
                 tombstones,
                 retired,
                 &changes,
-                Some((&self.name, end)),
-            )
+                ApplyMode::Durable(None),
+            )?;
+            if let Some(p) = progress {
+                p.add_journal_bytes(end - previous_end);
+                p.add_transactions(1);
+            }
+            previous_end = end;
+            Ok(())
         })?;
         recovery.insert(
             b"cursor",
@@ -416,6 +459,10 @@ fn journal_header(end: u64, generation: u64) -> [u8; 64] {
     finish_crc(&mut header);
     header
 }
+enum ApplyMode<'a> {
+    Durable(Option<(&'a str, u64)>),
+    Disposable,
+}
 fn apply(
     db: &Database,
     objects: &Keyspace,
@@ -423,36 +470,50 @@ fn apply(
     tombstones: &Keyspace,
     retired: &Keyspace,
     changes: &[Mutation],
-    cursor: Option<(&str, u64)>,
+    mode: ApplyMode<'_>,
 ) -> Result<()> {
-    let recovery = db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
-    let mut count = match recovery.get(b"objects")? {
+    let recovery = if matches!(mode, ApplyMode::Durable(_)) {
+        Some(db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?)
+    } else {
+        None
+    };
+    let mut count = match recovery
+        .as_ref()
+        .map(|space| space.get(b"objects"))
+        .transpose()?
+        .flatten()
+    {
         Some(value) => {
             ensure!(value.len() == 8, "invalid recovery object count");
             u64_at(&value, 0)
         }
-        None => objects.len()? as u64,
+        None if recovery.is_some() => objects.len()? as u64,
+        None => 0,
     };
     let mut presence = HashMap::new();
     let mut batch = db.batch();
     for change in changes {
         match change {
             Mutation::Put { hash, location } => {
-                let present = *presence.entry(*hash).or_insert(objects.contains_key(hash)?);
-                if !present {
-                    count = count.checked_add(1).context("object count overflow")?;
+                if recovery.is_some() {
+                    let present = *presence.entry(*hash).or_insert(objects.contains_key(hash)?);
+                    if !present {
+                        count = count.checked_add(1).context("object count overflow")?;
+                    }
+                    presence.insert(*hash, true);
                 }
-                presence.insert(*hash, true);
                 decode_loc(location)?;
                 batch.insert(objects, hash, location);
                 batch.remove(tombstones, hash);
             }
             Mutation::Delete { hash, timestamp } => {
-                let present = *presence.entry(*hash).or_insert(objects.contains_key(hash)?);
-                if present {
-                    count = count.checked_sub(1).context("object count underflow")?;
+                if recovery.is_some() {
+                    let present = *presence.entry(*hash).or_insert(objects.contains_key(hash)?);
+                    if present {
+                        count = count.checked_sub(1).context("object count underflow")?;
+                    }
+                    presence.insert(*hash, false);
                 }
-                presence.insert(*hash, false);
                 batch.remove(objects, hash);
                 batch.insert(tombstones, hash, timestamp.to_le_bytes());
             }
@@ -467,10 +528,12 @@ fn apply(
             Mutation::Cleaned { id } => batch.remove(retired, id),
         }
     }
-    batch.insert(&recovery, b"objects", count.to_le_bytes());
-    if let Some((journal, end)) = cursor {
+    if let Some(recovery) = &recovery {
+        batch.insert(recovery, b"objects", count.to_le_bytes());
+    }
+    if let ApplyMode::Durable(Some((journal, end))) = mode {
         batch.insert(
-            &recovery,
+            recovery.as_ref().context("missing recovery keyspace")?,
             b"cursor",
             serde_json::to_vec(&ReplayCursor {
                 journal: journal.into(),
@@ -517,7 +580,7 @@ impl Store {
             &self.tombstones,
             &self.retired,
             changes,
-            cursor,
+            ApplyMode::Durable(cursor),
         )?;
         failpoint("after_index_commit")?;
         self.db.persist(PersistMode::SyncAll)?;
@@ -1404,6 +1467,7 @@ impl Store {
             tombstones,
             retired,
             maintenance,
+            verification_control,
             _lock,
         } = self;
         drop((
@@ -1422,6 +1486,7 @@ impl Store {
             object_count,
             gc_pressure,
             maintenance,
+            verification_control,
         ));
         _lock
     }
@@ -1485,35 +1550,139 @@ pub(super) struct ScratchNamespace {
     retired: Option<Keyspace>,
     db: Option<Database>,
     path: PathBuf,
+    replay_end: u64,
 }
 impl ScratchNamespace {
     fn build(config: &Config, root: &Path, activation: &Activation) -> Result<Self> {
+        Self::build_checked(config, root, activation, None, None)
+    }
+    fn build_checked(
+        config: &Config,
+        root: &Path,
+        activation: &Activation,
+        check: Option<(&[Keyspace; 4], u64)>,
+        progress: Option<&crate::progress::Progress>,
+    ) -> Result<Self> {
         let path = std::env::temp_dir().join(format!("skerry-namespace-{}", Uuid::new_v4()));
         let (db, objects, segments) = open_db(&path, config)?;
         let tombstones = db.keyspace("tombstones", KeyspaceCreateOptions::default)?;
         let retired = db.keyspace("retired", KeyspaceCreateOptions::default)?;
-        let scratch = Self {
+        let mut scratch = Self {
             objects: Some(objects),
             segments: Some(segments),
             tombstones: Some(tombstones),
             retired: Some(retired),
             db: Some(db),
             path,
+            replay_end: JOURNAL_HEADER,
         };
-        let journal = Journal::read_only(
-            root,
-            activation
+        let journal = Journal {
+            name: activation
                 .journal
                 .as_deref()
-                .context("missing v2 journal")?,
-        )?;
-        journal.replay(
-            scratch.db.as_ref().unwrap(),
-            scratch.objects.as_ref().unwrap(),
-            scratch.segments.as_ref().unwrap(),
-            scratch.tombstones.as_ref().unwrap(),
-            scratch.retired.as_ref().unwrap(),
-        )?;
+                .context("missing v2 journal")?
+                .into(),
+            file: File::open(root.join(activation.journal.as_deref().unwrap()))?,
+        };
+        let compare = || -> Result<()> {
+            if let Some(p) = progress {
+                p.phase("comparing selected index");
+            }
+            if let Some((selected, _)) = check {
+                let mut differences = Vec::new();
+                for (name, expected, actual) in [
+                    ("objects", scratch.objects.as_ref().unwrap(), &selected[0]),
+                    ("segments", scratch.segments.as_ref().unwrap(), &selected[1]),
+                    (
+                        "tombstones",
+                        scratch.tombstones.as_ref().unwrap(),
+                        &selected[2],
+                    ),
+                    ("retired", scratch.retired.as_ref().unwrap(), &selected[3]),
+                ] {
+                    let mut left = expected.iter();
+                    let mut right = actual.iter();
+                    let mut a = left.next().map(|x| x.into_inner()).transpose()?;
+                    let mut b = right.next().map(|x| x.into_inner()).transpose()?;
+                    let (mut missing, mut unexpected, mut mismatched) = (0u64, 0u64, 0u64);
+                    while a.is_some() || b.is_some() {
+                        if let Some(p) = progress {
+                            ensure!(!p.is_cancelled(), "verification cancelled");
+                            p.add_index_entries(1);
+                        }
+                        match (&a, &b) {
+                            (Some((ak, av)), Some((bk, bv))) => match ak.cmp(bk) {
+                                std::cmp::Ordering::Less => {
+                                    missing += 1;
+                                    a = left.next().map(|x| x.into_inner()).transpose()?;
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    unexpected += 1;
+                                    b = right.next().map(|x| x.into_inner()).transpose()?;
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    if av != bv {
+                                        mismatched += 1;
+                                    }
+                                    a = left.next().map(|x| x.into_inner()).transpose()?;
+                                    b = right.next().map(|x| x.into_inner()).transpose()?;
+                                }
+                            },
+                            (Some(_), None) => {
+                                missing += 1;
+                                a = left.next().map(|x| x.into_inner()).transpose()?;
+                            }
+                            (None, Some(_)) => {
+                                unexpected += 1;
+                                b = right.next().map(|x| x.into_inner()).transpose()?;
+                            }
+                            (None, None) => break,
+                        }
+                    }
+                    if missing + unexpected + mismatched != 0 {
+                        differences.push(format!("selected index {name} differs: missing={missing} unexpected={unexpected} mismatched={mismatched}"));
+                    }
+                }
+                ensure!(differences.is_empty(), "{}", differences.join("; "));
+            }
+            Ok(())
+        };
+        let mut compared = false;
+        if check.is_some_and(|(_, cursor)| cursor == JOURNAL_HEADER) {
+            compare()?;
+            compared = true;
+        }
+        if let Some(p) = progress {
+            p.phase("replaying journal");
+        }
+        let mut previous_end = JOURNAL_HEADER;
+        let end = journal.visit_from(JOURNAL_HEADER, |changes, end| {
+            if let Some(p) = progress {
+                ensure!(!p.is_cancelled(), "verification cancelled");
+                p.add_journal_bytes(end - previous_end);
+                p.add_transactions(1);
+            }
+            previous_end = end;
+            apply(
+                scratch.db.as_ref().unwrap(),
+                scratch.objects.as_ref().unwrap(),
+                scratch.segments.as_ref().unwrap(),
+                scratch.tombstones.as_ref().unwrap(),
+                scratch.retired.as_ref().unwrap(),
+                &changes,
+                ApplyMode::Disposable,
+            )?;
+            if check.is_some_and(|(_, cursor)| cursor == end) {
+                compare()?;
+                compared = true;
+            }
+            Ok(())
+        })?;
+        ensure!(
+            check.is_none() || compared,
+            "index replay cursor is not a journal frame boundary"
+        );
+        scratch.replay_end = end;
         Ok(scratch)
     }
     pub fn source(config: &Config, root: &Path) -> Result<Option<Self>> {
@@ -1551,11 +1720,204 @@ impl Drop for ScratchNamespace {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
-pub(super) fn verify_v2(config: &Config) -> Result<Value> {
+fn copy_index_dir(
+    source: &Path,
+    target: &Path,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        if let Some(p) = progress {
+            ensure!(!p.is_cancelled(), "verification cancelled");
+        }
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_index_dir(&entry.path(), &target.join(entry.file_name()), progress)?;
+        } else if ty.is_file() {
+            let mut source = File::open(entry.path())?;
+            let mut destination = File::create(target.join(entry.file_name()))?;
+            let mut buffer = vec![0u8; 1024 * 1024];
+            loop {
+                if let Some(p) = progress {
+                    ensure!(!p.is_cancelled(), "verification cancelled");
+                }
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                destination.write_all(&buffer[..count])?;
+                if let Some(p) = progress {
+                    p.add_index_bytes(count as u64);
+                }
+            }
+        } else {
+            bail!("unsupported entry in index generation");
+        }
+    }
+    Ok(())
+}
+
+fn verify_orphan(
+    store: &Store,
+    path: &Path,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<()> {
+    let check = || -> Result<()> {
+        if let Some(p) = progress {
+            ensure!(!p.is_cancelled(), "verification cancelled");
+        }
+        Ok(())
+    };
+    let _permit = store
+        .verification_control
+        .acquire(store.config.verification.max_concurrency, check)?;
+    let limit = |bytes| {
+        store.verification_control.throttle(
+            bytes,
+            store.config.verification.max_bytes_per_second_mib,
+            check,
+        )
+    };
+    scan_file_progress(path, &store.root, true, true, progress, Some(&limit))?;
+    Ok(())
+}
+
+pub(super) fn verify_v1(
+    config: &Config,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<Value> {
+    config.validate()?;
+    let root = &config.storage.root;
+    let lock = store_lock(root)?;
+    let generation = selected_generation(root)?
+        .context("store has no selected index; initialize or rebuild first")?;
+    let copy_path = std::env::temp_dir().join(format!("skerry-v1-index-copy-{}", Uuid::new_v4()));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(copy_path.clone());
+    if let Some(p) = progress {
+        p.phase("copying selected index");
+    }
+    copy_index_dir(&generation, &copy_path, progress)?;
+    let (db, objects, segments) = open_db(&copy_path, config)?;
+    let tombstones = db.keyspace("tombstones", KeyspaceCreateOptions::default)?;
+    let retired = db.keyspace("retired", KeyspaceCreateOptions::default)?;
+    let store = Store {
+        db,
+        objects,
+        segments,
+        tombstones,
+        retired,
+        root: root.clone(),
+        config: config.clone(),
+        writer: Mutex::new(Writer::default()),
+        visibility: RwLock::new(()),
+        files: Mutex::new(FileCache {
+            entries: VecDeque::new(),
+            max: config.resources.max_open_segments,
+        }),
+        files_available: Condvar::new(),
+        object_count: AtomicU64::new(0),
+        gc_pressure: AtomicBool::new(false),
+        verification_control: crate::verification::Control::default(),
+        journal: None,
+        maintenance: Mutex::new(()),
+        _lock: lock,
+    };
+    store.recover(false, progress)?;
+    let status = store.status()?;
+    let mut orphaned = vec![];
+    for path in segment_files(root)? {
+        if let Some(p) = progress {
+            ensure!(!p.is_cancelled(), "verification cancelled");
+        }
+        let mut header = [0; 64];
+        File::open(&path)?.read_exact(&mut header)?;
+        let (id, _) = parse_header(&header)?;
+        if !store.segments.contains_key(id.as_bytes())? {
+            if let Some(p) = progress {
+                p.phase("scanning orphan segments");
+                p.clear_totals();
+            }
+            verify_orphan(&store, &path, progress)?;
+            orphaned.push(path.display().to_string());
+        }
+    }
+    Ok(json!({"status":"verified", "storage":status, "unreferenced_segments":orphaned}))
+}
+
+pub(super) fn verify_v2(
+    config: &Config,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<Value> {
     config.validate()?;
     let lock = store_lock(&config.storage.root)?;
     let activation = selected_activation(&config.storage.root)?.context("missing v2 activation")?;
-    let mut scratch = ScratchNamespace::build(config, &config.storage.root, &activation)?;
+    // Opening Fjall may write recovery files, so inspect a private copy.
+    let copy_path = std::env::temp_dir().join(format!("skerry-index-copy-{}", Uuid::new_v4()));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(copy_path.clone());
+    if let Some(p) = progress {
+        p.phase("copying selected index");
+    }
+    copy_index_dir(
+        &selected_generation(&config.storage.root)?.context("missing selected index")?,
+        &copy_path,
+        progress,
+    )?;
+    let (selected_db, selected_objects, selected_segments) = open_db(&copy_path, config)?;
+    let selected_tombstones = selected_db.keyspace("tombstones", KeyspaceCreateOptions::default)?;
+    let selected_retired = selected_db.keyspace("retired", KeyspaceCreateOptions::default)?;
+    let recovery = selected_db.keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)?;
+    let cursor = recovery
+        .get(b"cursor")?
+        .map(|v| serde_json::from_slice::<ReplayCursor>(&v))
+        .transpose()?;
+    let journal = Journal {
+        name: activation
+            .journal
+            .as_deref()
+            .context("missing journal")?
+            .into(),
+        file: File::open(
+            config
+                .storage
+                .root
+                .join(activation.journal.as_deref().unwrap()),
+        )?,
+    };
+    let witness = journal.witness()?;
+    let valid_cursor = cursor
+        .as_ref()
+        .filter(|c| c.journal == journal.name && c.end >= JOURNAL_HEADER && c.end <= witness.floor);
+    let selected = [
+        selected_objects,
+        selected_segments,
+        selected_tombstones,
+        selected_retired,
+    ];
+    let mut scratch = ScratchNamespace::build_checked(
+        config,
+        &config.storage.root,
+        &activation,
+        valid_cursor.map(|c| (&selected, c.end)),
+        progress,
+    )?;
+    let recovery_required =
+        valid_cursor.is_none_or(|c| c.end < scratch.replay_end) || witness.degraded;
+    drop(recovery);
+    drop(selected);
+    drop(selected_db);
     let store = Store {
         db: scratch.db.take().unwrap(),
         objects: scratch.objects.take().unwrap(),
@@ -1572,22 +1934,30 @@ pub(super) fn verify_v2(config: &Config) -> Result<Value> {
         }),
         files_available: Condvar::new(),
         object_count: AtomicU64::new(0),
+        verification_control: crate::verification::Control::default(),
         gc_pressure: AtomicBool::new(false),
         journal: None,
         maintenance: Mutex::new(()),
         _lock: lock,
     };
-    store.recover(false)?;
+    store.recover(false, progress)?;
     let status = store.status()?;
     let mut orphaned = vec![];
     for path in segment_files(&config.storage.root)? {
+        if let Some(p) = progress {
+            ensure!(!p.is_cancelled(), "verification cancelled");
+        }
         let mut header = [0; 64];
         File::open(&path)?.read_exact(&mut header)?;
         let (id, _) = parse_header(&header)?;
         if !store.segments.contains_key(id.as_bytes())?
             && !store.retired.contains_key(id.as_bytes())?
         {
-            scan_file(&path, &config.storage.root, true, true)?;
+            if let Some(p) = progress {
+                p.phase("scanning orphan segments");
+                p.clear_totals();
+            }
+            verify_orphan(&store, &path, progress)?;
             orphaned.push(path.display().to_string());
         }
     }
@@ -1595,7 +1965,7 @@ pub(super) fn verify_v2(config: &Config) -> Result<Value> {
     drop(store);
     drop(scratch);
     Ok(
-        json!({"status":"verified","version":2,"storage":status,"unreferenced_segments":orphaned,"retired_segments_pending_cleanup":pending}),
+        json!({"status":"verified","version":2,"storage":status,"unreferenced_segments":orphaned,"retired_segments_pending_cleanup":pending,"recovery_required":recovery_required}),
     )
 }
 
@@ -1669,6 +2039,338 @@ mod witness_tests {
         assert_eq!(store.status().unwrap().objects, 1);
         drop(store);
         Store::verify(&config).unwrap();
+    }
+
+    #[test]
+    fn v1_verification_does_not_modify_source_files() {
+        fn snapshot(
+            root: &Path,
+            dir: &Path,
+            out: &mut Vec<(PathBuf, u64, std::time::SystemTime, Vec<u8>)>,
+        ) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    snapshot(root, &path, out);
+                } else {
+                    let meta = fs::metadata(&path).unwrap();
+                    out.push((
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        meta.len(),
+                        meta.modified().unwrap(),
+                        fs::read(&path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        store
+            .put_many(&[Bytes::from_static(b"v1 content")])
+            .unwrap();
+        drop(store);
+        fs::remove_file(config.storage.root.join("format-v2")).unwrap();
+        let generation = selected_generation(&config.storage.root).unwrap().unwrap();
+        activate(&config.storage.root, &generation).unwrap();
+        let mut before = Vec::new();
+        snapshot(&config.storage.root, &config.storage.root, &mut before);
+        before.sort();
+        Store::verify(&config).unwrap();
+        let mut after = Vec::new();
+        snapshot(&config.storage.root, &config.storage.root, &mut after);
+        after.sort();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn corrupt_worker_stops_throttled_peer_promptly() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        config.verification.max_concurrency = 2;
+        config.verification.max_bytes_per_second_mib = 1;
+        let store = Store::open(&config).unwrap();
+        store
+            .put_many(&[Bytes::from(vec![1; 4 * 1024 * 1024])])
+            .unwrap();
+        store.seal().unwrap();
+        store
+            .put_many(&[Bytes::from(vec![2; 4 * 1024 * 1024])])
+            .unwrap();
+        store.seal().unwrap();
+        let paths = segment_files(&config.storage.root).unwrap();
+        let mut corrupt = OpenOptions::new().write(true).open(&paths[0]).unwrap();
+        corrupt.seek(SeekFrom::Start(0)).unwrap();
+        corrupt.write_all(b"corrupt!").unwrap();
+        drop(corrupt);
+        let start = Instant::now();
+        assert!(store.recover(false, None).is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "peer scan did not stop promptly: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn verify_reports_missing_unexpected_and_mismatched_index_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let values = store
+            .put_many(&[Bytes::from_static(b"first"), Bytes::from_static(b"second")])
+            .unwrap();
+        store.objects.remove(values[0].hash).unwrap();
+        store.objects.insert(values[1].hash, b"wrong").unwrap();
+        let extra = [0u8; 32];
+        assert_ne!(extra, values[0].hash);
+        assert_ne!(extra, values[1].hash);
+        store.objects.insert(extra, b"extra").unwrap();
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        drop(store);
+        let error = Store::verify(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("objects differs: missing=1 unexpected=1 mismatched=1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn orphan_scan_updates_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        drop(Store::open(&config).unwrap());
+        let mut other = config.clone();
+        other.storage.root = root.path().join("other");
+        let source = Store::open(&other).unwrap();
+        source.put_many(&[Bytes::from_static(b"orphan")]).unwrap();
+        source.seal().unwrap();
+        let path = segment_files(&other.storage.root).unwrap().remove(0);
+        drop(source);
+        let destination = config
+            .storage
+            .root
+            .join(path.strip_prefix(&other.storage.root).unwrap());
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(path, destination).unwrap();
+        let progress = Arc::new(crate::progress::Progress::new());
+        let result = Store::verify_with_progress(&config, &progress).unwrap();
+        assert_eq!(result["unreferenced_segments"].as_array().unwrap().len(), 1);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.segments_verified, 1);
+        assert_eq!(snapshot.records_checked, 1);
+        assert!(snapshot.bytes_scanned >= 64 + 64 + 6 + 96);
+        assert!(snapshot.bytes_total.is_none());
+    }
+
+    #[test]
+    fn orphan_scan_can_be_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        drop(Store::open(&config).unwrap());
+        let mut other = config.clone();
+        other.storage.root = root.path().join("other");
+        let source = Store::open(&other).unwrap();
+        source
+            .put_many(&[Bytes::from(vec![7; 4 * 1024 * 1024])])
+            .unwrap();
+        source.seal().unwrap();
+        let path = segment_files(&other.storage.root).unwrap().remove(0);
+        drop(source);
+        let destination = config
+            .storage
+            .root
+            .join(path.strip_prefix(&other.storage.root).unwrap());
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(path, destination).unwrap();
+        config.verification.max_bytes_per_second_mib = 1;
+        let progress = Arc::new(crate::progress::Progress::new());
+        let worker_progress = progress.clone();
+        let worker =
+            std::thread::spawn(move || Store::verify_with_progress(&config, &worker_progress));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while progress.snapshot().phase != "scanning orphan segments" {
+            assert!(Instant::now() < deadline, "orphan scan never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let start = Instant::now();
+        progress.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn verify_detects_selected_index_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let hash = store.put_many(&[Bytes::from_static(b"test")]).unwrap()[0].hash;
+        store.objects.remove(hash).unwrap();
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        drop(store);
+        let error = Store::verify(&config).unwrap_err().to_string();
+        assert!(error.contains("selected index objects differs"), "{error}");
+    }
+
+    #[test]
+    fn verify_detects_mismatch_in_each_selected_keyspace() {
+        for space in ["segments", "tombstones", "retired"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.storage.root = root.path().join("store");
+            let store = Store::open(&config).unwrap();
+            let keyspace = match space {
+                "segments" => &store.segments,
+                "tombstones" => &store.tombstones,
+                _ => &store.retired,
+            };
+            keyspace.insert([99; 16], [1]).unwrap();
+            store.db.persist(PersistMode::SyncAll).unwrap();
+            drop(store);
+            let error = Store::verify(&config).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("selected index {space} differs")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_reports_unapplied_journal_without_mutating_index() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        store
+            .journal
+            .as_ref()
+            .unwrap()
+            .lock()
+            .append(&[Mutation::Delete {
+                hash: [42; 32],
+                timestamp: 1,
+            }])
+            .unwrap();
+        drop(store);
+        let report = Store::verify(&config).unwrap();
+        assert_eq!(report["recovery_required"], true);
+        assert_eq!(Store::verify(&config).unwrap()["recovery_required"], true);
+    }
+
+    #[test]
+    fn unapplied_journal_does_not_hide_index_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let hash = store.put_many(&[Bytes::from_static(b"test")]).unwrap()[0].hash;
+        store.objects.remove(hash).unwrap();
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        store
+            .journal
+            .as_ref()
+            .unwrap()
+            .lock()
+            .append(&[Mutation::Delete { hash, timestamp: 1 }])
+            .unwrap();
+        drop(store);
+        assert!(
+            Store::verify(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("selected index objects differs")
+        );
+    }
+
+    #[test]
+    fn verify_reports_missing_cursor_as_recovery_required() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        store.put_many(&[Bytes::from_static(b"test")]).unwrap();
+        let recovery = store
+            .db
+            .keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)
+            .unwrap();
+        recovery.remove(b"cursor").unwrap();
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        drop(recovery);
+        drop(store);
+        assert_eq!(Store::verify(&config).unwrap()["recovery_required"], true);
+    }
+
+    #[test]
+    fn interrupted_full_replay_never_exposes_partial_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let hash = store.put_many(&[Bytes::from_static(b"preserved")]).unwrap()[0].hash;
+        let name = store.journal.as_ref().unwrap().lock().name.clone();
+        drop(store);
+        let path = config.storage.root.join(&name);
+        let original = fs::read(&path).unwrap();
+        let mut corrupt = original.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        let generation = selected_generation(&config.storage.root).unwrap().unwrap();
+        let (db, objects, segments) = open_db(&generation, &config).unwrap();
+        let tombstones = db
+            .keyspace("tombstones", KeyspaceCreateOptions::default)
+            .unwrap();
+        let retired = db
+            .keyspace("retired", KeyspaceCreateOptions::default)
+            .unwrap();
+        let journal = Journal {
+            name,
+            file: File::open(&path).unwrap(),
+        };
+        assert!(
+            journal
+                .replay(&db, &objects, &segments, &tombstones, &retired)
+                .is_err()
+        );
+        let recovery = db
+            .keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)
+            .unwrap();
+        assert!(recovery.get(b"cursor").unwrap().is_none());
+        drop((
+            recovery, objects, segments, tombstones, retired, db, journal,
+        ));
+        fs::write(path, original).unwrap();
+        let store = Store::open(&config).unwrap();
+        assert_eq!(store.get(&hash).unwrap().unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn startup_full_replay_reports_journal_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().join("store");
+        let store = Store::open(&config).unwrap();
+        let hash = store.put_many(&[Bytes::from_static(b"preserved")]).unwrap()[0].hash;
+        let recovery = store
+            .db
+            .keyspace(RECOVERY_SPACE, KeyspaceCreateOptions::default)
+            .unwrap();
+        recovery.remove(b"cursor").unwrap();
+        store.db.persist(PersistMode::SyncAll).unwrap();
+        drop(recovery);
+        drop(store);
+        let progress = Arc::new(crate::progress::Progress::new());
+        let store = Store::open_with_progress(&config, &progress).unwrap();
+        assert_eq!(store.get(&hash).unwrap().unwrap(), b"preserved");
+        let snapshot = progress.snapshot();
+        assert!(snapshot.transactions_processed > 0);
+        assert!(snapshot.journal_bytes > 0);
     }
 
     #[test]

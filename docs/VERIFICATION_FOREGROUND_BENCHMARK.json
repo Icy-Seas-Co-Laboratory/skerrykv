@@ -1,0 +1,48 @@
+{
+  "baseline_idle": {
+    "overlapped_requests": 0,
+    "p50_ms": 0.082625,
+    "p95_ms": 0.090792,
+    "requests_per_second": 11926.236228924105,
+    "total_ms": 41.924375
+  },
+  "benchmark": "verification_foreground_get_latency",
+  "comparison": {
+    "p95_ratio_during_to_idle": 0.9692483919288043,
+    "requests_overlapping_verification": 500
+  },
+  "environment": {
+    "architecture": "aarch64",
+    "os": "macos"
+  },
+  "foreground_reads": 500,
+  "method": "engine-level Store::get (BLAKE3-verified payload reads)",
+  "scope": "This does not include Coordinator admission/queueing, application cache, HTTP, or MCP overhead.",
+  "seed": {
+    "note": "Application payload cache is disabled. The baseline runs first and can warm the operating-system page cache, so this is not a cold-disk comparison.",
+    "object_bytes": 131072,
+    "objects": 128,
+    "payload_cache_mib": 0,
+    "segments": 1,
+    "total_payload_bytes": 16777216
+  },
+  "verification": {
+    "bytes_scanned": 16785568,
+    "bytes_verified": 16777216,
+    "duration_seconds": 2.458257709,
+    "max_bytes_per_second_mib": 8,
+    "max_concurrency": 1,
+    "report_verified_bytes": 16785568,
+    "report_verified_records": 128,
+    "segment_id": "e33c167f-7c41-4a55-a68d-b0c5b4162d35",
+    "segments_verified": 1,
+    "state": "completed"
+  },
+  "while_verification_runs": {
+    "overlapped_requests": 500,
+    "p50_ms": 0.081208,
+    "p95_ms": 0.088,
+    "requests_per_second": 12137.186718577577,
+    "total_ms": 41.195707999999996
+  }
+}

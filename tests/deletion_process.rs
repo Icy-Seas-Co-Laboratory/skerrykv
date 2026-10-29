@@ -113,7 +113,7 @@ impl Process {
                 panic!("service exited early: {status}");
             }
             if client
-                .get(format!("{}/v1/health", fixture.url))
+                .get(format!("{}/v1/ready", fixture.url))
                 .bearer_auth(TOKEN)
                 .send()
                 .await

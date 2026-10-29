@@ -127,7 +127,9 @@ pub fn router_with_mcp_credentials(
     };
     Ok(Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/ready", get(ready))
         .route("/v1/status", get(status))
+        .route("/v1/indexes", get(indexes))
         .route("/v1/metrics", get(metrics))
         .route("/v1/objects", put(put_object))
         .route(
@@ -147,7 +149,11 @@ pub fn router_with_mcp_credentials(
 
 async fn admission(State(app): State<App>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if path != "/v1/health" && path != app.store.config.mcp.http_path && path != "/v1/mcp/status" {
+    if path != "/v1/health"
+        && path != "/v1/ready"
+        && path != app.store.config.mcp.http_path
+        && path != "/v1/mcp/status"
+    {
         let supplied = req
             .headers()
             .get(header::AUTHORIZATION)
@@ -245,22 +251,62 @@ async fn admission(State(app): State<App>, req: Request, next: Next) -> Response
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-async fn health(State(app): State<App>) -> ApiResult {
-    let status = app.store.status().await.map_err(internal)?;
-    let ok = status.health == "ok" || status.health == "running" || status.health == "healthy";
+async fn health() -> ApiResult {
+    Ok(
+        Json(serde_json::json!({"health":"ok","version":env!("CARGO_PKG_VERSION")}))
+            .into_response(),
+    )
+}
+async fn ready(State(app): State<App>) -> ApiResult {
+    let ready = app.store.is_ready() && !app.shutdown.is_cancelled();
     Ok((
-        if ok {
+        if ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        Json(serde_json::json!({"health":status.health,"version":status.version})),
+        Json(serde_json::json!({"ready":ready})),
     )
         .into_response())
 }
 
 async fn status(State(app): State<App>) -> ApiResult {
     Ok(Json(app.store.status().await.map_err(internal)?).into_response())
+}
+
+#[derive(Deserialize)]
+struct IndexQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+async fn indexes(State(app): State<App>, Query(query): Query<IndexQuery>) -> ApiResult {
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 1000".into(),
+        ));
+    }
+    if query.after.as_deref().is_some_and(|name| {
+        name.strip_prefix("generation-")
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .is_none()
+    }) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid index cursor".into(),
+        ));
+    }
+    let permit = app.store.try_request_permit().map_err(internal)?;
+    let store = app.store.storage();
+    let page = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.indexes(query.after.as_deref(), limit)
+    })
+    .await
+    .map_err(|e| internal(e.into()))?
+    .map_err(internal)?;
+    Ok(Json(page).into_response())
 }
 
 async fn metrics(State(app): State<App>) -> ApiResult {
@@ -1360,5 +1406,525 @@ mod tests {
         bad[52] = 4;
         let mut decoder = Decoder::new(Body::from(bad));
         assert!(decoder.next(REQUEST_PUT, 100).await.is_err());
+    }
+}
+
+/// Validates the listener and credentials before the socket is opened.
+pub fn validate_bootstrap(
+    config: &crate::config::Config,
+    credentials: &crate::mcp::Credentials,
+) -> Result<()> {
+    credentials.validate()?;
+    let addr: SocketAddr = config
+        .server
+        .listen
+        .parse()
+        .context("invalid listen address")?;
+    if !addr.ip().is_loopback() && credentials.service.is_none() {
+        return Err(anyhow!("a non-loopback listener requires SKERRY_TOKEN"));
+    }
+    Ok(())
+}
+
+type ReadyService = Arc<parking_lot::RwLock<Option<(Router, Arc<Coordinator>)>>>;
+#[derive(Clone)]
+struct Bootstrap {
+    config: crate::config::Config,
+    credentials: crate::mcp::Credentials,
+    shutdown: CancellationToken,
+    progress: Arc<crate::progress::Progress>,
+    ready: ReadyService,
+    error: Arc<parking_lot::RwLock<Option<String>>>,
+    requests: Arc<Semaphore>,
+}
+
+fn public_startup(app: &Bootstrap) -> serde_json::Value {
+    let mut snapshot = app.progress.snapshot();
+    if !snapshot.failures.is_empty() {
+        snapshot.failures = vec!["storage initialization failed; inspect server logs".into()];
+    }
+    serde_json::to_value(snapshot).unwrap_or_default()
+}
+
+async fn bootstrap_admission(State(app): State<Bootstrap>, req: Request, next: Next) -> Response {
+    let permit = match app.requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "request capacity exhausted; retry later".into(),
+            )
+            .into_response();
+        }
+    };
+    let timeout = Duration::from_secs(app.config.server.request_timeout_seconds);
+    let response = match tokio::time::timeout(timeout, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => ApiError(
+            StatusCode::REQUEST_TIMEOUT,
+            "request deadline exceeded".into(),
+        )
+        .into_response(),
+    };
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let _permit = permit;
+        let mut source = body.into_data_stream();
+        while let Some(chunk) = source.next().await { yield chunk; }
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+async fn bootstrap_dispatch(State(app): State<Bootstrap>, req: Request) -> Response {
+    use tower::ServiceExt;
+    let path = req.uri().path();
+    if path == "/v1/health" {
+        return Json(serde_json::json!({"health":"ok","version":env!("CARGO_PKG_VERSION")}))
+            .into_response();
+    }
+    if path == "/v1/ready" {
+        let coordinator = app.ready.read().as_ref().map(|(_, c)| c.clone());
+        let ready = if let Some(coordinator) = coordinator {
+            coordinator.is_ready()
+        } else {
+            false
+        };
+        return (
+            if ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            Json(serde_json::json!({"ready":ready})),
+        )
+            .into_response();
+    }
+    let credentials = &app.credentials;
+    let supplied = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let all = [
+        &credentials.service,
+        &credentials.read,
+        &credentials.write,
+        &credentials.maintenance,
+        &credentials.gateway,
+    ];
+    let has = all.iter().any(|v| v.is_some());
+    let admin = credentials
+        .service
+        .as_ref()
+        .is_some_and(|v| bool::from(supplied.as_bytes().ct_eq(v.as_bytes())))
+        || (!has && supplied.is_empty());
+    let scoped = [
+        &credentials.read,
+        &credentials.write,
+        &credentials.maintenance,
+    ]
+    .iter()
+    .any(|v| {
+        v.as_ref()
+            .is_some_and(|v| bool::from(supplied.as_bytes().ct_eq(v.as_bytes())))
+    });
+    if !admin && !scoped && path != app.config.mcp.http_path && path != "/v1/mcp/status" {
+        return ApiError(StatusCode::UNAUTHORIZED, "bearer token required".into()).into_response();
+    }
+    if path == "/v1/indexes" && !admin {
+        return ApiError(
+            StatusCode::FORBIDDEN,
+            "operation is not authorized for this token".into(),
+        )
+        .into_response();
+    }
+    if path == "/v1/status" || path == "/v1/admin/shutdown" {
+        if !admin {
+            return ApiError(
+                StatusCode::FORBIDDEN,
+                "operation is not authorized for this token".into(),
+            )
+            .into_response();
+        }
+        if path == "/v1/admin/shutdown" && req.method() == axum::http::Method::POST {
+            app.shutdown.cancel();
+            return Json(serde_json::json!({"status":"shutting down"})).into_response();
+        }
+        if path == "/v1/status" && req.method() == axum::http::Method::GET {
+            let coordinator = app.ready.read().as_ref().map(|(_, c)| c.clone());
+            let mut value = if let Some(c) = coordinator {
+                match tokio::time::timeout(Duration::from_millis(500), c.status()).await {
+                    Ok(Ok(s)) => serde_json::to_value(s).unwrap_or_default(),
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "status details unavailable");
+                        serde_json::json!({})
+                    }
+                    Err(_) => serde_json::json!({}),
+                }
+            } else {
+                serde_json::json!({})
+            };
+            let error = app.error.read().clone();
+            value["lifecycle"] = serde_json::json!(if error.is_some() {
+                "failed"
+            } else if app.ready.read().is_some() {
+                "ready"
+            } else {
+                "starting"
+            });
+            value["startup"] = public_startup(&app);
+            if let Some(error) = error {
+                value["startup_error"] = serde_json::json!(error);
+            }
+            return Json(value).into_response();
+        }
+    }
+    let router = app.ready.read().as_ref().map(|(r, _)| r.clone());
+    if let Some(router) = router {
+        return router
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|never| match never {});
+    }
+    if !admin {
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage is not ready".into(),
+        )
+        .into_response();
+    }
+    let failed = app.error.read().is_some();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "storage is not ready",
+            "lifecycle": if failed { "failed" } else { "starting" },
+            "startup": public_startup(&app),
+        })),
+    )
+        .into_response()
+}
+
+/// Serve immediately while the coordinator opens in the background.
+pub async fn serve_bootstrap(
+    config: crate::config::Config,
+    credentials: crate::mcp::Credentials,
+    progress: Arc<crate::progress::Progress>,
+    shutdown: CancellationToken,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
+    validate_bootstrap(&config, &credentials)?;
+    let app = Bootstrap {
+        config: config.clone(),
+        credentials: credentials.clone(),
+        shutdown: shutdown.clone(),
+        progress: progress.clone(),
+        ready: Arc::new(parking_lot::RwLock::new(None)),
+        error: Arc::new(parking_lot::RwLock::new(None)),
+        requests: Arc::new(Semaphore::new(config.resources.max_requests)),
+    };
+    let startup_app = app.clone();
+    let startup = tokio::spawn(async move {
+        match Coordinator::open_with_progress(config, progress.clone()).await {
+            Ok(store) => {
+                if startup_app.shutdown.is_cancelled() {
+                    let _ = store.shutdown().await;
+                    return;
+                }
+                match router_with_mcp_credentials(
+                    store.clone(),
+                    startup_app.shutdown.clone(),
+                    credentials,
+                ) {
+                    Ok(router) => {
+                        let installed = {
+                            let mut ready = startup_app.ready.write();
+                            if startup_app.shutdown.is_cancelled() {
+                                false
+                            } else {
+                                *ready = Some((router, store.clone()));
+                                true
+                            }
+                        };
+                        if installed {
+                            progress.finish();
+                        } else {
+                            let _ = store.shutdown().await;
+                        }
+                    }
+                    Err(_) => {
+                        *startup_app.error.write() = Some("API initialization failed".into());
+                        progress.fail("API initialization failed");
+                        let _ = store.shutdown().await;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "storage startup failed");
+                *startup_app.error.write() =
+                    Some("storage initialization failed; inspect server logs".into());
+                progress.fail("storage initialization failed; inspect server logs");
+            }
+        }
+    });
+    let force = CancellationToken::new();
+    let listener = DrainListener {
+        listener,
+        force: force.clone(),
+        connections: Arc::new(Semaphore::new(app.config.resources.max_requests * 2)),
+    };
+    let router = Router::new()
+        .fallback(bootstrap_dispatch)
+        .with_state(app.clone())
+        .layer(middleware::from_fn_with_state(
+            app.clone(),
+            bootstrap_admission,
+        ));
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future();
+    tokio::pin!(server);
+    let result = tokio::select! { result = &mut server => result.context("HTTP server failed"), _ = shutdown.cancelled() => {
+        app.progress.cancel();
+        match tokio::time::timeout(Duration::from_secs(app.config.server.shutdown_timeout_seconds), &mut server).await {
+            Ok(result) => result.context("HTTP server failed"), Err(_) => { force.cancel(); Err(anyhow!("HTTP drain timeout")) }
+        }
+    }};
+    shutdown.cancel();
+    app.progress.cancel();
+    let coordinator = app.ready.write().take().map(|(_, c)| c);
+    if let Some(coordinator) = coordinator {
+        coordinator.shutdown().await?;
+    }
+    // Recovery checks cancellation between bounded units of work.
+    if tokio::time::timeout(
+        Duration::from_secs(app.config.server.shutdown_timeout_seconds),
+        startup,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("storage startup did not stop before the shutdown deadline");
+    }
+    result
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn starting_api_reports_liveness_readiness_and_requires_admin() {
+        let shutdown = CancellationToken::new();
+        let progress = Arc::new(crate::progress::Progress::new());
+        let app = Bootstrap {
+            config: crate::config::Config::default(),
+            credentials: crate::mcp::Credentials {
+                service: Some("secret".into()),
+                read: Some("reader".into()),
+                ..Default::default()
+            },
+            shutdown: shutdown.clone(),
+            progress,
+            ready: Arc::new(parking_lot::RwLock::new(None)),
+            error: Arc::new(parking_lot::RwLock::new(None)),
+            requests: Arc::new(Semaphore::new(8)),
+        };
+        let router = Router::new()
+            .fallback(bootstrap_dispatch)
+            .with_state(app.clone());
+        for (path, token, expected) in [
+            ("/v1/health", None, StatusCode::OK),
+            ("/v1/ready", None, StatusCode::SERVICE_UNAVAILABLE),
+            ("/v1/status", None, StatusCode::UNAUTHORIZED),
+            ("/v1/status", Some("secret"), StatusCode::OK),
+            (
+                "/v1/indexes",
+                Some("secret"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut request = Request::builder().uri(path);
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        for (path, token, expected) in [
+            ("/v1/mcp/status", None, StatusCode::SERVICE_UNAVAILABLE),
+            ("/v1/indexes", Some("reader"), StatusCode::FORBIDDEN),
+            (
+                "/v1/objects/abc",
+                Some("reader"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut request = Request::builder().uri(path);
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("startup"));
+        }
+        *app.error.write() = Some("storage initialization failed".into());
+        app.progress.fail("failed to read /private/store/path");
+        let request = Request::builder()
+            .uri("/v1/status")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["lifecycle"], "failed");
+        assert!(!String::from_utf8_lossy(&bytes).contains("/private/store/path"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/shutdown")
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(shutdown.is_cancelled());
+    }
+    #[tokio::test]
+    async fn index_listing_requires_admin_and_supports_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.storage.root = dir.path().to_path_buf();
+        let coordinator = Coordinator::open(config).await.unwrap();
+        let fake = format!("generation-{}", uuid::Uuid::new_v4());
+        std::fs::create_dir(dir.path().join("index").join(fake)).unwrap();
+        let credentials = crate::mcp::Credentials {
+            service: Some("admin".into()),
+            read: Some("reader".into()),
+            ..Default::default()
+        };
+        let router =
+            router_with_mcp_credentials(coordinator.clone(), CancellationToken::new(), credentials)
+                .unwrap();
+        for (token, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("reader"), StatusCode::FORBIDDEN),
+            (Some("admin"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/v1/indexes?limit=1");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap();
+                let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let cursor = page["next_cursor"].as_str().unwrap();
+                let request = Request::builder()
+                    .uri(format!("/v1/indexes?limit=1&after={cursor}"))
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap();
+                let next: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(next["indexes"].as_array().unwrap().len(), 1);
+                assert!(next["next_cursor"].is_null());
+            }
+        }
+        coordinator.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn failed_storage_start_keeps_api_available_and_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"file").unwrap();
+        let mut config = crate::config::Config::default();
+        config.storage.root = root;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.server.listen = listener.local_addr().unwrap().to_string();
+        let url = format!("http://{}", config.server.listen);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_bootstrap(
+            config,
+            Default::default(),
+            Arc::new(crate::progress::Progress::new()),
+            cancel,
+            listener,
+        ));
+        let client = reqwest::Client::new();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(response) = client.get(format!("{url}/v1/status")).send().await {
+                    let status: serde_json::Value = response.json().await.unwrap();
+                    if status["lifecycle"] == "failed" {
+                        break status;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status["lifecycle"], "failed");
+        assert_eq!(
+            client
+                .get(format!("{url}/v1/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{url}/v1/ready"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            client
+                .post(format!("{url}/v1/admin/shutdown"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

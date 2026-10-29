@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+mod indexes;
 mod maintenance;
 use maintenance::{Journal, Mutation};
 
@@ -112,6 +113,7 @@ pub struct Store {
     files: Mutex<FileCache>,
     files_available: Condvar,
     object_count: AtomicU64,
+    verification_control: crate::verification::Control,
     gc_pressure: AtomicBool,
     journal: Option<Mutex<Journal>>,
     tombstones: Keyspace,
@@ -606,11 +608,44 @@ fn scan_prefix_visit(
     allow_incomplete: bool,
     visit: &mut dyn FnMut([u8; 32], Location) -> Result<()>,
 ) -> Result<(u64, u64)> {
+    scan_prefix_visit_digest(
+        file,
+        id,
+        end,
+        allow_incomplete,
+        visit,
+        ScanContext::default(),
+    )
+}
+#[derive(Default)]
+struct ScanContext<'a> {
+    whole: Option<&'a mut blake3::Hasher>,
+    progress: Option<&'a crate::progress::Progress>,
+    throttle: Option<&'a dyn Fn(u64) -> Result<()>>,
+}
+fn scan_prefix_visit_digest(
+    file: &mut File,
+    id: Uuid,
+    end: u64,
+    allow_incomplete: bool,
+    visit: &mut dyn FnMut([u8; 32], Location) -> Result<()>,
+    context: ScanContext<'_>,
+) -> Result<(u64, u64)> {
+    let ScanContext {
+        mut whole,
+        progress,
+        throttle,
+    } = context;
     ensure!(end >= 64, "invalid segment end");
+    file.seek(SeekFrom::Start(64))?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut offset = 64;
     let mut count = 0;
     let mut buf = [0; 64 * 1024];
     while offset < end {
+        if let Some(p) = progress {
+            ensure!(!p.is_cancelled(), "verification cancelled");
+        }
         if end - offset < 64 {
             ensure!(
                 allow_incomplete,
@@ -619,8 +654,10 @@ fn scan_prefix_visit(
             break;
         }
         let mut h = [0; 64];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut h)?;
+        if let Some(limit) = throttle {
+            limit(64)?;
+        }
+        reader.read_exact(&mut h)?;
         if allow_incomplete && h.iter().all(|x| *x == 0) {
             break;
         }
@@ -632,18 +669,40 @@ fn scan_prefix_visit(
             ensure!(allow_incomplete, "truncated payload below committed end");
             break;
         }
+        if let Some(ref mut digest) = whole {
+            digest.update(&h);
+        }
+        if let Some(p) = progress {
+            p.add_bytes(64);
+        }
         let mut hasher = blake3::Hasher::new();
         let mut left = len;
         while left > 0 {
+            if let Some(p) = progress {
+                ensure!(!p.is_cancelled(), "verification cancelled");
+            }
             let n = left.min(buf.len() as u64) as usize;
-            file.read_exact(&mut buf[..n])?;
+            if let Some(limit) = throttle {
+                limit(n as u64)?;
+            }
+            reader.read_exact(&mut buf[..n])?;
             hasher.update(&buf[..n]);
+            if let Some(ref mut digest) = whole {
+                digest.update(&buf[..n]);
+            }
+            if let Some(p) = progress {
+                p.add_bytes(n as u64);
+            }
             left -= n as u64;
         }
         ensure!(
             hasher.finalize().as_bytes() == &hash,
             "payload BLAKE3 mismatch in segment {id} at {payload}"
         );
+        if let Some(p) = progress {
+            p.add_records(1);
+            p.add_verified_bytes(len);
+        }
         visit(
             hash,
             Location {
@@ -658,12 +717,31 @@ fn scan_prefix_visit(
     Ok((count, offset))
 }
 fn scan_file(path: &Path, root: &Path, salvage: bool, canonical: bool) -> Result<Option<Scanned>> {
+    scan_file_progress(path, root, salvage, canonical, None, None)
+}
+fn scan_file_progress(
+    path: &Path,
+    root: &Path,
+    salvage: bool,
+    canonical: bool,
+    progress: Option<&crate::progress::Progress>,
+    throttle: Option<&dyn Fn(u64) -> Result<()>>,
+) -> Result<Option<Scanned>> {
+    if let Some(p) = progress {
+        ensure!(!p.is_cancelled(), "verification cancelled");
+    }
+    if let Some(limit) = throttle {
+        limit(64)?;
+    }
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     ensure!(len >= 64, "truncated segment header: {}", path.display());
     let mut h = [0; 64];
     file.read_exact(&mut h)?;
     let (id, created) = parse_header(&h)?;
+    if let Some(p) = progress {
+        p.add_bytes(64);
+    }
     ensure!(
         path.file_name().and_then(|s| s.to_str()) == Some(format!("{id}.seg").as_str()),
         "segment filename UUID mismatch"
@@ -671,6 +749,9 @@ fn scan_file(path: &Path, root: &Path, salvage: bool, canonical: bool) -> Result
     let mut fbuf = [0; 96];
     let sealed = if len >= 160 {
         file.seek(SeekFrom::Start(len - 96))?;
+        if let Some(limit) = throttle {
+            limit(96)?;
+        }
         file.read_exact(&mut fbuf)?;
         &fbuf[..8] == END_MAGIC
     } else {
@@ -683,17 +764,36 @@ fn scan_file(path: &Path, root: &Path, salvage: bool, canonical: bool) -> Result
     };
     let end = footer.as_ref().map_or(len, |f| f.end);
     ensure!(end <= len, "footer end outside segment");
-    let (count, valid_end) =
-        scan_prefix_visit(&mut file, id, end, footer.is_none(), &mut |_, _| Ok(()))?;
+    let mut whole = blake3::Hasher::new();
+    whole.update(&h);
+    let (count, valid_end) = scan_prefix_visit_digest(
+        &mut file,
+        id,
+        end,
+        footer.is_none(),
+        &mut |_, _| Ok(()),
+        ScanContext {
+            whole: Some(&mut whole),
+            progress,
+            throttle,
+        },
+    )?;
     if let Some(f) = &footer {
         ensure!(
             f.id == id && f.end.checked_add(96) == Some(len) && f.count == count,
             "seal footer identity/count/end mismatch"
         );
         ensure!(
-            digest_prefix(&mut file, end)? == f.digest,
+            *whole.finalize().as_bytes() == f.digest,
             "whole-segment digest mismatch"
         );
+        if let Some(p) = progress {
+            p.add_bytes(96);
+        }
+    }
+    if let Some(p) = progress {
+        p.add_segments(1);
+        p.add_verified_segments(1);
     }
     if footer.is_none() && !salvage {
         return Ok(None);
@@ -753,6 +853,18 @@ impl Store {
     pub fn verify(config: &Config) -> Result<serde_json::Value> {
         verify(config)
     }
+    pub fn verify_with_progress(
+        config: &Config,
+        progress: &Arc<crate::progress::Progress>,
+    ) -> Result<serde_json::Value> {
+        progress.phase("verification");
+        let result = verify_progress(config, Some(progress));
+        match &result {
+            Ok(_) => progress.finish(),
+            Err(e) => progress.fail(&e.to_string()),
+        }
+        result
+    }
     pub fn rebuild(config: &Config, salvage: bool) -> Result<serde_json::Value> {
         rebuild(config, salvage)
     }
@@ -762,7 +874,29 @@ impl Store {
     pub fn open(config: &Config) -> Result<Self> {
         Self::open_mode(config, true)
     }
+    pub fn open_with_progress(
+        config: &Config,
+        progress: &Arc<crate::progress::Progress>,
+    ) -> Result<Self> {
+        progress.phase("opening");
+        let result = (|| {
+            ensure!(!progress.is_cancelled(), "opening cancelled");
+            Self::open_mode_progress(config, true, Some(progress))
+        })();
+        match &result {
+            Ok(_) => progress.finish(),
+            Err(e) => progress.fail(&e.to_string()),
+        }
+        result
+    }
     fn open_mode(config: &Config, repair: bool) -> Result<Self> {
+        Self::open_mode_progress(config, repair, None)
+    }
+    fn open_mode_progress(
+        config: &Config,
+        repair: bool,
+        progress: Option<&crate::progress::Progress>,
+    ) -> Result<Self> {
         config.validate()?;
         let root = config.storage.root.clone();
         let lock = store_lock(&root)?;
@@ -802,7 +936,7 @@ impl Store {
                 .transpose()?
         };
         if repair && let Some(journal) = &journal {
-            journal.recover_index(&db, &objects, &segments, &tombstones, &retired)?;
+            journal.recover_index(&db, &objects, &segments, &tombstones, &retired, progress)?;
         }
         if new {
             db.persist(PersistMode::SyncAll)?;
@@ -827,6 +961,7 @@ impl Store {
             }),
             files_available: Condvar::new(),
             object_count: AtomicU64::new(0),
+            verification_control: crate::verification::Control::default(),
             gc_pressure: AtomicBool::new(false),
             journal: journal.map(Mutex::new),
             tombstones,
@@ -841,121 +976,271 @@ impl Store {
             sync_root_marker(&store.root, &activation)?;
             store.cleanup_retired()?;
         }
-        store.recover(repair)?;
+        store.recover(repair, progress)?;
         Ok(store)
     }
-    fn recover(&self, repair: bool) -> Result<()> {
+    fn verify_offline_scan(
+        &self,
+        meta: &Meta,
+        progress: Option<&crate::progress::Progress>,
+        abort: &AtomicBool,
+    ) -> Result<(u64, [u8; 32])> {
+        let check = || -> Result<()> {
+            ensure!(!abort.load(Ordering::Acquire), "peer verification failed");
+            if let Some(p) = progress {
+                ensure!(!p.is_cancelled(), "verification cancelled");
+            }
+            Ok(())
+        };
+        let _permit = self
+            .verification_control
+            .acquire(self.config.verification.max_concurrency, check)?;
+        let limit = |bytes| {
+            self.verification_control.throttle(
+                bytes,
+                self.config.verification.max_bytes_per_second_mib,
+                check,
+            )
+        };
+        let path = segment_path(&self.root, meta);
+        ensure!(!path.is_symlink(), "referenced segment is a symlink");
+        let mut file = File::open(&path)
+            .with_context(|| format!("missing/inaccessible referenced segment {}", meta.id))?;
+        let mut head = [0; 64];
+        file.read_exact(&mut head)?;
+        let (id, created) = parse_header(&head)?;
+        ensure!(
+            id == meta.id && created == meta.created,
+            "segment header/manifest mismatch"
+        );
+        ensure!(
+            file.metadata()?.len() >= meta.end,
+            "committed data truncated in segment {id}"
+        );
+        let mut whole = blake3::Hasher::new();
+        whole.update(&head);
+        let mut matched = 0;
+        let mut live = 0;
+        let (count, end) = scan_prefix_visit_digest(
+            &mut file,
+            id,
+            meta.end,
+            false,
+            &mut |hash, loc| {
+                if let Some(v) = self.objects.get(hash)?
+                    && decode_loc(&v)? == loc
+                {
+                    matched += 1;
+                    live += loc.length;
+                }
+                Ok(())
+            },
+            ScanContext {
+                whole: Some(&mut whole),
+                progress,
+                throttle: Some(&limit),
+            },
+        )?;
+        ensure!(
+            end == meta.end && count == meta.count,
+            "committed segment count/end mismatch"
+        );
+        ensure!(
+            live == meta.live,
+            "segment live-byte metadata mismatch for {id}"
+        );
+        if let Some(p) = progress {
+            p.add_bytes(64);
+            p.add_segments(1);
+        }
+        Ok((matched, *whole.finalize().as_bytes()))
+    }
+    fn recover(&self, repair: bool, progress: Option<&crate::progress::Progress>) -> Result<()> {
+        if let Some(p) = progress {
+            p.phase("scanning segments");
+            let mut segments_total = 0u64;
+            let mut bytes_total = 0u64;
+            for entry in self.segments.iter() {
+                let (key, value) = entry.into_inner()?;
+                let meta = decode_meta(Uuid::from_slice(&key)?, &value)?;
+                segments_total += 1;
+                bytes_total = bytes_total
+                    .checked_add(meta.end + if meta.state == 1 { SEGMENT_FOOTER } else { 0 })
+                    .context("verification total overflow")?;
+            }
+            p.set_segments_total(segments_total);
+            if !repair {
+                p.set_bytes_total(bytes_total);
+            }
+        }
         let mut writer = self.writer.lock();
         let mut object_count = 0u64;
-        for item in self.segments.iter() {
-            let (k, v) = item.into_inner()?;
-            let id = Uuid::from_slice(&k)?;
-            let mut meta = decode_meta(id, &v)?;
-            ensure!(
-                meta.state != 2,
-                "segment {id} is quarantined; offline repair required"
-            );
-            let path = segment_path(&self.root, &meta);
-            ensure!(!path.is_symlink(), "referenced segment is a symlink");
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(meta.state == 0 && repair)
-                .open(&path)
-                .with_context(|| format!("missing/inaccessible referenced segment {id}"))?;
-            let mut head = [0; 64];
-            file.read_exact(&mut head)?;
-            let (header_id, created) = parse_header(&head)?;
-            ensure!(
-                header_id == id && created == meta.created,
-                "segment header/manifest mismatch"
-            );
-            let physical = file.metadata()?.len();
-            ensure!(
-                physical >= meta.end,
-                "committed data truncated in segment {id}"
-            );
-            if !repair {
-                let mut live = 0u64;
-                let (count, end) =
-                    scan_prefix_visit(&mut file, id, meta.end, false, &mut |hash, loc| {
-                        if let Some(v) = self.objects.get(hash)?
-                            && decode_loc(&v)? == loc
-                        {
-                            object_count += 1;
-                            live += loc.length;
-                        }
-                        Ok(())
-                    })?;
-                ensure!(
-                    end == meta.end && count == meta.count,
-                    "committed segment count/end mismatch"
-                );
-                ensure!(
-                    live == meta.live,
-                    "segment live-byte metadata mismatch for {id}"
-                );
-            }
-            if meta.state == 1 {
-                ensure!(
-                    physical == meta.end + 96 && meta.physical == physical,
-                    "sealed segment length mismatch"
-                );
-                let mut buf = [0; 96];
-                file.seek(SeekFrom::Start(meta.end))?;
-                file.read_exact(&mut buf)?;
-                let f = parse_footer(&buf)?;
-                ensure!(
-                    f.id == id
-                        && f.end == meta.end
-                        && f.count == meta.count
-                        && Some(f.digest) == meta.digest
-                        && f.sealed == meta.sealed,
-                    "sealed segment metadata mismatch"
-                );
-                ensure!(
-                    repair || digest_prefix(&mut file, meta.end)? == f.digest,
-                    "sealed segment digest mismatch"
-                );
+        let mut entries = self.segments.iter();
+        loop {
+            let mut batch = Vec::new();
+            for item in entries.by_ref().take(if repair {
+                1
             } else {
-                let mut sealed = false;
-                if physical == meta.end + 96 {
-                    let mut b = [0; 96];
+                self.config.verification.max_concurrency
+            }) {
+                let (k, v) = item.into_inner()?;
+                let id = Uuid::from_slice(&k)?;
+                batch.push(decode_meta(id, &v)?);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let scans = if repair {
+                Vec::new()
+            } else {
+                let abort = AtomicBool::new(false);
+                let first_error = Mutex::new(None::<String>);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|meta| {
+                            let abort = &abort;
+                            let first_error = &first_error;
+                            scope.spawn(move || {
+                                let result = self.verify_offline_scan(meta, progress, abort);
+                                if let Err(error) = &result {
+                                    let mut first = first_error.lock();
+                                    if first.is_none() {
+                                        *first = Some(format!("{error:#}"));
+                                    }
+                                    abort.store(true, Ordering::Release);
+                                }
+                                result
+                            })
+                        })
+                        .collect();
+                    let mut results = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        match handle.join() {
+                            Ok(Ok(value)) => results.push(value),
+                            Ok(Err(_)) => {}
+                            Err(_) => {
+                                let mut first = first_error.lock();
+                                if first.is_none() {
+                                    *first = Some("verification worker panicked".into());
+                                }
+                                abort.store(true, Ordering::Release);
+                            }
+                        }
+                    }
+                    if let Some(error) = first_error.lock().take() {
+                        anyhow::bail!("{error}");
+                    }
+                    Ok::<_, anyhow::Error>(results)
+                })?
+            };
+            for (index, mut meta) in batch.into_iter().enumerate() {
+                if let Some(p) = progress {
+                    ensure!(!p.is_cancelled(), "verification cancelled");
+                }
+                let id = meta.id;
+                ensure!(
+                    meta.state != 2,
+                    "segment {id} is quarantined; offline repair required"
+                );
+                let path = segment_path(&self.root, &meta);
+                ensure!(!path.is_symlink(), "referenced segment is a symlink");
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(meta.state == 0 && repair)
+                    .open(&path)
+                    .with_context(|| format!("missing/inaccessible referenced segment {id}"))?;
+                let mut head = [0; 64];
+                file.read_exact(&mut head)?;
+                let (header_id, created) = parse_header(&head)?;
+                ensure!(
+                    header_id == id && created == meta.created,
+                    "segment header/manifest mismatch"
+                );
+                let physical = file.metadata()?.len();
+                ensure!(
+                    physical >= meta.end,
+                    "committed data truncated in segment {id}"
+                );
+                let verified_digest = if !repair {
+                    let (matched, digest) = scans[index];
+                    object_count += matched;
+                    Some(digest)
+                } else {
+                    None
+                };
+                if meta.state == 1 {
+                    ensure!(
+                        physical == meta.end + 96 && meta.physical == physical,
+                        "sealed segment length mismatch"
+                    );
+                    let mut buf = [0; 96];
                     file.seek(SeekFrom::Start(meta.end))?;
-                    file.read_exact(&mut b)?;
-                    if let Ok(f) = parse_footer(&b) {
+                    file.read_exact(&mut buf)?;
+                    let f = parse_footer(&buf)?;
+                    ensure!(
+                        f.id == id
+                            && f.end == meta.end
+                            && f.count == meta.count
+                            && Some(f.digest) == meta.digest
+                            && f.sealed == meta.sealed,
+                        "sealed segment metadata mismatch"
+                    );
+                    ensure!(
+                        repair || verified_digest == Some(f.digest),
+                        "sealed segment digest mismatch"
+                    );
+                    if !repair && let Some(p) = progress {
+                        p.add_bytes(SEGMENT_FOOTER);
+                    }
+                } else {
+                    let mut sealed = false;
+                    if physical == meta.end + 96 {
+                        let mut b = [0; 96];
+                        file.seek(SeekFrom::Start(meta.end))?;
+                        file.read_exact(&mut b)?;
+                        if let Ok(f) = parse_footer(&b) {
+                            ensure!(
+                                f.id == id && f.end == meta.end && f.count == meta.count,
+                                "interrupted seal footer mismatch"
+                            );
+                            ensure!(
+                                repair || verified_digest == Some(f.digest),
+                                "interrupted seal digest mismatch"
+                            );
+                            meta.state = 1;
+                            meta.digest = Some(f.digest);
+                            meta.sealed = f.sealed;
+                            meta.physical = physical;
+                            sealed = true;
+                        }
+                    }
+                    if sealed && repair {
+                        self.publish(&[Mutation::segment(&meta)])?;
+                    } else if !sealed {
                         ensure!(
-                            f.id == id && f.end == meta.end && f.count == meta.count,
-                            "interrupted seal footer mismatch"
+                            writer.active.is_none(),
+                            "multiple active segments in single-volume store"
                         );
-                        ensure!(
-                            repair || digest_prefix(&mut file, meta.end)? == f.digest,
-                            "interrupted seal digest mismatch"
-                        );
-                        meta.state = 1;
-                        meta.digest = Some(f.digest);
-                        meta.sealed = f.sealed;
-                        meta.physical = physical;
-                        sealed = true;
+                        if repair && (physical != meta.end || meta.physical != meta.end) {
+                            file.set_len(meta.end)?;
+                            file.sync_all()?;
+                            meta.physical = meta.end;
+                            self.publish(&[Mutation::segment(&meta)])?;
+                        }
+                        file.seek(SeekFrom::Start(meta.end))?;
+                        writer.active = Some(Active {
+                            file,
+                            meta: meta.clone(),
+                        });
                     }
                 }
-                if sealed && repair {
-                    self.publish(&[Mutation::segment(&meta)])?;
-                } else if !sealed {
-                    ensure!(
-                        writer.active.is_none(),
-                        "multiple active segments in single-volume store"
-                    );
-                    if repair && (physical != meta.end || meta.physical != meta.end) {
-                        file.set_len(meta.end)?;
-                        file.sync_all()?;
-                        meta.physical = meta.end;
-                        self.publish(&[Mutation::segment(&meta)])?;
+                if let Some(p) = progress {
+                    if repair {
+                        p.add_segments(1);
+                    } else {
+                        p.add_verified_segments(1);
                     }
-                    file.seek(SeekFrom::Start(meta.end))?;
-                    writer.active = Some(Active {
-                        file,
-                        meta: meta.clone(),
-                    });
                 }
             }
         }
@@ -1440,6 +1725,40 @@ impl Store {
         cancelled: Arc<AtomicBool>,
         max_duration: Duration,
     ) -> Result<crate::inspection::VerificationReport> {
+        self.verify_segment_impl(id, progress, cancelled, max_duration, None)
+    }
+    pub fn verify_segment_with_progress_bounded(
+        &self,
+        id: Uuid,
+        progress: Arc<crate::progress::Progress>,
+        cancelled: Arc<AtomicBool>,
+        max_duration: Duration,
+    ) -> Result<crate::inspection::VerificationReport> {
+        progress.phase("verifying segment");
+        let result = self.verify_segment_impl(
+            id,
+            Arc::new(AtomicU64::new(0)),
+            cancelled,
+            max_duration,
+            Some(&progress),
+        );
+        match &result {
+            Ok(_) => progress.finish(),
+            Err(e) => {
+                tracing::warn!(error=%e, "segment verification failed");
+                progress.fail("segment verification failed or cancelled; inspect server logs");
+            }
+        }
+        result
+    }
+    fn verify_segment_impl(
+        &self,
+        id: Uuid,
+        progress: Arc<AtomicU64>,
+        cancelled: Arc<AtomicBool>,
+        max_duration: Duration,
+        detail: Option<&crate::progress::Progress>,
+    ) -> Result<crate::inspection::VerificationReport> {
         ensure!(
             !max_duration.is_zero(),
             "verification duration must be positive"
@@ -1449,7 +1768,7 @@ impl Store {
             .context("verification deadline overflow")?;
         let check = || -> Result<()> {
             ensure!(
-                !cancelled.load(Ordering::Acquire),
+                !cancelled.load(Ordering::Acquire) && !detail.is_some_and(|p| p.is_cancelled()),
                 "segment verification cancelled"
             );
             ensure!(
@@ -1459,6 +1778,16 @@ impl Store {
             Ok(())
         };
         check()?;
+        let _verification_permit = self
+            .verification_control
+            .acquire(self.config.verification.max_concurrency, check)?;
+        let throttle = |bytes| {
+            self.verification_control.throttle(
+                bytes,
+                self.config.verification.max_bytes_per_second_mib,
+                check,
+            )
+        };
         progress.store(0, Ordering::Release);
         let lease_visibility = self.visibility.read();
         let meta = {
@@ -1469,6 +1798,10 @@ impl Store {
             decode_meta(id, &value)?
         };
         ensure!(meta.state != 2, "segment quarantined");
+        if let Some(p) = detail {
+            p.set_bytes_total(meta.end + if meta.state == 1 { SEGMENT_FOOTER } else { 0 });
+            p.set_segments_total(1);
+        }
         let path = segment_path(&self.root, &meta);
         let file = {
             let mut cache = self.files.lock();
@@ -1509,6 +1842,7 @@ impl Store {
                 "committed segment extent truncated"
             );
             let mut header = [0; 64];
+            throttle(SEGMENT_HEADER)?;
             read_exact_at(&file, &mut header, 0)?;
             let (header_id, created) = parse_header(&header)?;
             ensure!(
@@ -1518,6 +1852,9 @@ impl Store {
             let mut whole = blake3::Hasher::new();
             whole.update(&header);
             progress.store(64, Ordering::Release);
+            if let Some(p) = detail {
+                p.add_bytes(64);
+            }
             let mut position = SEGMENT_HEADER;
             let mut count = 0;
             let mut buffer = [0; 64 * 1024];
@@ -1528,6 +1865,7 @@ impl Store {
                     "truncated committed record header"
                 );
                 let mut record = [0; 64];
+                throttle(RECORD_HEADER)?;
                 read_exact_at(&file, &mut record, position)?;
                 let (length, expected_hash) = parse_record(&record)?;
                 let payload = position
@@ -1539,22 +1877,33 @@ impl Store {
                 ensure!(next <= meta.end, "committed record exceeds segment extent");
                 whole.update(&record);
                 progress.fetch_add(RECORD_HEADER, Ordering::Release);
+                if let Some(p) = detail {
+                    p.add_bytes(RECORD_HEADER);
+                }
                 let mut object = blake3::Hasher::new();
                 let mut offset = payload;
                 while offset < next {
                     check()?;
                     let n = (next - offset).min(buffer.len() as u64) as usize;
+                    throttle(n as u64)?;
                     read_exact_at(&file, &mut buffer[..n], offset)?;
                     object.update(&buffer[..n]);
                     whole.update(&buffer[..n]);
                     offset += n as u64;
                     progress.fetch_add(n as u64, Ordering::Release);
+                    if let Some(p) = detail {
+                        p.add_bytes(n as u64);
+                    }
                 }
                 ensure!(
                     object.finalize().as_bytes() == &expected_hash,
                     "segment payload BLAKE3 mismatch"
                 );
                 count += 1;
+                if let Some(p) = detail {
+                    p.add_records(1);
+                    p.add_verified_bytes(length);
+                }
                 position = next;
             }
             ensure!(
@@ -1573,6 +1922,7 @@ impl Store {
                     "sealed segment length mismatch"
                 );
                 let mut footer_bytes = [0; 96];
+                throttle(SEGMENT_FOOTER)?;
                 read_exact_at(&file, &mut footer_bytes, meta.end)?;
                 let footer = parse_footer(&footer_bytes)?;
                 ensure!(
@@ -1588,8 +1938,15 @@ impl Store {
                     "whole-segment BLAKE3 mismatch"
                 );
                 progress.fetch_add(SEGMENT_FOOTER, Ordering::Release);
+                if let Some(p) = detail {
+                    p.add_bytes(SEGMENT_FOOTER);
+                }
             }
             check()?;
+            if let Some(p) = detail {
+                p.add_segments(1);
+                p.add_verified_segments(1);
+            }
             Ok(crate::inspection::VerificationReport {
                 segment_id: id.to_string(),
                 verified_bytes: progress.load(Ordering::Acquire),
@@ -1688,24 +2045,21 @@ fn read_exact_at(file: &File, mut out: &mut [u8], mut offset: u64) -> Result<()>
 }
 
 pub fn verify(config: &Config) -> Result<serde_json::Value> {
+    verify_progress(config, None)
+}
+fn verify_progress(
+    config: &Config,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<serde_json::Value> {
+    if let Some(p) = progress {
+        ensure!(!p.is_cancelled(), "verification cancelled");
+    }
     // Verify committed bytes under exclusive ownership, without truncating or adopting tails.
     ensure!(config.storage.root.is_dir(), "store does not exist");
     if selected_activation(&config.storage.root)?.is_some_and(|a| a.version == 2) {
-        return maintenance::verify_v2(config);
+        return maintenance::verify_v2(config, progress);
     }
-    let store = Store::open_mode(config, false)?;
-    let status = store.status()?;
-    let mut orphaned = vec![];
-    for p in segment_files(&config.storage.root)? {
-        let mut h = [0; 64];
-        File::open(&p)?.read_exact(&mut h)?;
-        let (id, _) = parse_header(&h)?;
-        if !store.segments.contains_key(id.as_bytes())? {
-            scan_file(&p, &config.storage.root, true, true)?;
-            orphaned.push(p.display().to_string());
-        }
-    }
-    Ok(serde_json::json!({"status":"verified","storage":status,"unreferenced_segments":orphaned}))
+    maintenance::verify_v1(config, progress)
 }
 
 pub fn rebuild(config: &Config, salvage: bool) -> Result<serde_json::Value> {

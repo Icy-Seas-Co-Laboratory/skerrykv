@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use skerrykv::{config::Config, coordinator::Coordinator, engine::Store};
+use skerrykv::{config::Config, engine::Store};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
@@ -50,6 +50,24 @@ enum Command {
     },
     /// Probe service health; exits unsuccessfully when the service is unhealthy.
     Health {
+        #[arg(
+            long = "connect",
+            alias = "url",
+            default_value = "http://127.0.0.1:7788"
+        )]
+        connect: String,
+    },
+    /// Probe whether storage is ready to serve requests.
+    Ready {
+        #[arg(
+            long = "connect",
+            alias = "url",
+            default_value = "http://127.0.0.1:7788"
+        )]
+        connect: String,
+    },
+    /// List persisted index generations.
+    Indexes {
         #[arg(
             long = "connect",
             alias = "url",
@@ -257,6 +275,14 @@ async fn main() -> Result<()> {
             let v = request_json(&connect, "/v1/health", reqwest::Method::GET).await?;
             output_json(v, false);
         }
+        Command::Ready { connect } => {
+            let v = request_json(&connect, "/v1/ready", reqwest::Method::GET).await?;
+            output_json(v, false);
+        }
+        Command::Indexes { connect } => {
+            let v = request_json(&connect, "/v1/indexes", reqwest::Method::GET).await?;
+            output_json(v, true);
+        }
         Command::Status { connect, json } => {
             let v = request_json(&connect, "/v1/status", reqwest::Method::GET).await?;
             output_json(v, json);
@@ -312,10 +338,24 @@ async fn main() -> Result<()> {
         }
         Command::Verify { path } => {
             let cfg = offline_config(&path)?;
-            println!(
-                "{}",
-                tokio::task::spawn_blocking(move || Store::verify(&cfg)).await??
+            let progress = Arc::new(skerrykv::progress::Progress::new());
+            let work_progress = progress.clone();
+            let mut task = tokio::task::spawn_blocking(move || {
+                Store::verify_with_progress(&cfg, &work_progress)
+            });
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let result = loop {
+                tokio::select! {
+                    result = &mut task => break result?,
+                    _ = shutdown_signal() => { progress.cancel(); break task.await?; },
+                    _ = interval.tick() => eprintln!("verify progress: {}", serde_json::to_string(&progress.snapshot())?),
+                }
+            };
+            eprintln!(
+                "verify progress: {}",
+                serde_json::to_string(&progress.snapshot())?
             );
+            println!("{}", result?);
         }
         Command::RebuildIndex { path, salvage } => {
             let cfg = offline_config(&path)?;
@@ -477,15 +517,18 @@ async fn serve(path: PathBuf, show_tui: bool) -> Result<()> {
     if needs_token(&cfg.server.listen) && cfg.token().is_none() {
         bail!("SKERRY_TOKEN must be set when listening on a non-loopback address");
     }
-    std::fs::create_dir_all(&cfg.storage.root)?;
+    let credentials = skerrykv::mcp::Credentials::from_env();
+    skerrykv::server::validate_bootstrap(&cfg, &credentials)?;
     let listen = cfg.server.listen.clone();
-    let coordinator = Coordinator::open(cfg).await?;
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .context("cannot bind HTTP listener")?;
+    let progress = Arc::new(skerrykv::progress::Progress::new());
     let cancel = CancellationToken::new();
     let server_cancel = cancel.clone();
-    let mut server =
-        tokio::spawn(
-            async move { skerrykv::server::serve(coordinator.clone(), server_cancel).await },
-        );
+    let mut server = tokio::spawn(async move {
+        skerrykv::server::serve_bootstrap(cfg, credentials, progress, server_cancel, listener).await
+    });
     eprintln!("SkerryKV listening at http://{listen}");
     if show_tui {
         let url = local_url(&listen);

@@ -44,3 +44,19 @@ pub struct VerificationReport {
     /// may finish later without changing the verified committed prefix.
     pub sealed: bool,
 }
+
+/// A persisted database generation; retained generations are not opened by listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub selected: bool,
+    pub state: String,
+    pub format_version: Option<u8>,
+    /// Enumerated only for the selected, already-open generation.
+    pub keyspaces: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexPage {
+    pub indexes: Vec<IndexInfo>,
+    pub next_cursor: Option<String>,
+}

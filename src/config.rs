@@ -18,7 +18,26 @@ pub struct Config {
     pub cache: Cache,
     pub logging: Logging,
     pub mcp: Mcp,
+    pub verification: Verification,
     pub gc: Gc,
+}
+
+/// Resource controls shared by online and offline integrity scans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Verification {
+    /// Maximum number of verification scans allowed to run at once.
+    pub max_concurrency: usize,
+    /// Maximum scan read rate in MiB/s; zero disables throttling.
+    pub max_bytes_per_second_mib: u64,
+}
+impl Default for Verification {
+    fn default() -> Self {
+        Self {
+            max_concurrency: 1,
+            max_bytes_per_second_mib: 0,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -475,6 +494,17 @@ impl Config {
             self.server.shutdown_timeout_seconds > 0 && self.server.request_timeout_seconds > 0,
             "timeouts must be positive"
         );
+        ensure!(
+            (1..=16).contains(&self.verification.max_concurrency),
+            "verification.max_concurrency must be 1..16"
+        );
+        ensure!(
+            self.verification
+                .max_bytes_per_second_mib
+                .checked_mul(1024 * 1024)
+                .is_some(),
+            "verification bandwidth limit overflows bytes"
+        );
         self.mcp.validate(self.max_object_bytes())?;
         self.gc.validate()?;
         Ok(())
@@ -510,5 +540,18 @@ mod tests {
         invalid.resources.max_inflight_read_mib = 1;
         assert!(invalid.validate().is_err());
         assert!(toml::from_str::<Config>("[reads]\npolciy='ssd'").is_err());
+    }
+    #[test]
+    fn verification_limits_default_and_validate() {
+        let mut config = Config::default();
+        assert_eq!(config.verification.max_concurrency, 1);
+        assert_eq!(config.verification.max_bytes_per_second_mib, 0);
+        config.verification.max_concurrency = 0;
+        assert!(config.validate().is_err());
+        config.verification.max_concurrency = 17;
+        assert!(config.validate().is_err());
+        config.verification.max_concurrency = 2;
+        config.verification.max_bytes_per_second_mib = u64::MAX;
+        assert!(config.validate().is_err());
     }
 }

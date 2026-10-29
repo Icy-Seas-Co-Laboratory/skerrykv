@@ -43,7 +43,7 @@ class Service:
                 if self.child.poll() is not None:
                     raise RuntimeError("smoke service exited before readiness")
                 try:
-                    if self.call("GET", "/v1/health")[0] == 200:
+                    if self.call("GET", "/v1/ready")[0] == 200:
                         return
                 except OSError:
                     pass
@@ -101,7 +101,7 @@ def main():
         config = archive / "config.toml"
         root = Path(tomllib.loads(config.read_text())["storage"]["root"])
         if not root.is_absolute():
-            root = (Path.cwd() / root).resolve()
+            root = (config.parent / root).resolve()
         payloads = [b"survivor", b"delete this object", b"", bytes(range(256)) * 512]
         hashes = []
         with Service(initializer, config) as service:

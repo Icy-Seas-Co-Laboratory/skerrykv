@@ -278,6 +278,47 @@ fn render_tab(
     let Some(v) = v else {
         return "Waiting for service status…".into();
     };
+    if v["lifecycle"]
+        .as_str()
+        .is_some_and(|state| state != "ready")
+        && v["storage"].is_null()
+    {
+        let startup = &v["startup"];
+        let field = |value: &Value, key: &str| {
+            value[key].as_str().map(str::to_owned).unwrap_or_else(|| {
+                if value[key].is_null() {
+                    "—".to_owned()
+                } else {
+                    value[key].to_string()
+                }
+            })
+        };
+        let lifecycle = field(v, "lifecycle");
+        let mut lines = vec![
+            format!("Service lifecycle: {lifecycle}"),
+            format!("Startup state: {}", field(startup, "state")),
+            format!("Phase: {}", field(startup, "phase")),
+            format!(
+                "Bytes scanned: {} / {}",
+                field(startup, "bytes_scanned"),
+                field(startup, "bytes_total")
+            ),
+            format!("Journal bytes: {}", field(startup, "journal_bytes")),
+            format!(
+                "Transactions processed: {}",
+                field(startup, "transactions_processed")
+            ),
+        ];
+        if let Some(failures) = startup["failures"].as_array() {
+            for failure in failures.iter().filter_map(Value::as_str) {
+                lines.push(format!("Startup failure: {failure}"));
+            }
+        }
+        if let Some(error) = v["startup_error"].as_str() {
+            lines.push(format!("Startup error: {error}"));
+        }
+        return lines.join("\n");
+    }
     let storage = &v["storage"];
     let io = &v["io"];
     let cache = &v["cache"];
@@ -380,8 +421,28 @@ fn render_tab(
         }
         _ => {
             let mcp = &v["mcp"];
+            let verification = mcp["active_verifications"]
+                .as_array()
+                .map(|jobs| {
+                    jobs.iter()
+                        .map(|job| {
+                            let progress = &job["progress"];
+                            format!(
+                                "{} {}: {} bytes, {} records, {} segments, {} B/s",
+                                field(job, "segment_id"),
+                                field(progress, "phase"),
+                                field(progress, "bytes_scanned"),
+                                field(progress, "records_checked"),
+                                field(progress, "segments_processed"),
+                                field(progress, "bytes_per_second")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
             format!(
-                "Enabled: {}\nRead only: {}\nActive MCP HTTP exchanges: {}\nTool calls: {} ({}/s)\nFailed tool calls: {}\nAuthorization failures: {}\nAverage tool latency: {} ms\nInflight requests: {}\nVerification jobs: {}",
+                "Enabled: {}\nRead only: {}\nActive MCP HTTP exchanges: {}\nTool calls: {} ({}/s)\nFailed tool calls: {}\nAuthorization failures: {}\nAverage tool latency: {} ms\nInflight requests: {}\nVerification jobs: {}\n{}",
                 field(mcp, "enabled"),
                 field(mcp, "read_only"),
                 field(mcp, "active_connections"),
@@ -393,7 +454,8 @@ fn render_tab(
                 field(mcp, "authorization_failures"),
                 field(mcp, "average_tool_latency_ms"),
                 field(mcp, "inflight_requests"),
-                field(mcp, "verification_jobs")
+                field(mcp, "verification_jobs"),
+                verification
             )
         }
     }
@@ -476,5 +538,45 @@ fn local_url(listen: &str) -> String {
         format!("http://[{local}]:{port}")
     } else {
         format!("http://{local}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_starting_lifecycle_without_typed_storage_status() {
+        let startup = serde_json::json!({
+            "state": "running",
+            "phase": "replay journal",
+            "bytes_scanned": 2048,
+            "bytes_total": 8192,
+            "journal_bytes": 1024,
+            "transactions_processed": 3,
+            "failures": []
+        });
+        let status = serde_json::json!({"lifecycle":"starting", "startup":startup});
+        let rendered = render_tab(0, Some(&status), None, None);
+        assert!(rendered.contains("Service lifecycle: starting"));
+        assert!(rendered.contains("Phase: replay journal"));
+        assert!(rendered.contains("Bytes scanned: 2048 / 8192"));
+        assert!(rendered.contains("Journal bytes: 1024"));
+        assert!(rendered.contains("Transactions processed: 3"));
+    }
+
+    #[test]
+    fn renders_startup_failure_details_without_typed_storage_status() {
+        let status = serde_json::json!({
+            "lifecycle":"failed",
+            "startup":{"state":"failed", "phase":"replay journal", "bytes_scanned":64,
+                "journal_bytes":64, "transactions_processed":1, "failures":["checksum mismatch"]},
+            "startup_error":"storage initialization failed"
+        });
+        let rendered = render_tab(0, Some(&status), None, None);
+        assert!(rendered.contains("Service lifecycle: failed"));
+        assert!(rendered.contains("Startup state: failed"));
+        assert!(rendered.contains("Startup failure: checksum mismatch"));
+        assert!(rendered.contains("Startup error: storage initialization failed"));
     }
 }

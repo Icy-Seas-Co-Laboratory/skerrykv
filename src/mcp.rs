@@ -3,6 +3,7 @@ use crate::{
     config::{Config, Mcp},
     coordinator::{Coordinator, ResourceExhausted},
     inspection::VerificationReport,
+    progress::{Progress, ProgressSnapshot},
 };
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -84,6 +85,8 @@ pub struct McpStatus {
     pub average_tool_latency_ms: f64,
     pub inflight_requests: usize,
     pub verification_jobs: usize,
+    #[serde(default)]
+    pub active_verifications: Vec<VerificationJobSummary>,
     pub rate_rejections: u64,
     pub retained_response_bytes: usize,
 }
@@ -96,16 +99,26 @@ pub struct VerificationStatus {
     pub job_id: String,
     pub segment_id: String,
     pub state: String,
+    /// Compatibility counter for bytes scanned; prefer `progress.bytes_verified`
+    /// when callers need bytes whose payload checks have completed.
     pub verified_bytes: u64,
     pub report: Option<VerificationReport>,
     pub error: Option<String>,
+    /// Detailed counters and timing for clients that can render live progress.
+    pub progress: ProgressSnapshot,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationJobSummary {
+    pub job_id: String,
+    pub segment_id: String,
+    pub progress: ProgressSnapshot,
 }
 struct Job {
     id: Uuid,
     segment: Uuid,
     owner: [u8; 32],
     created: Instant,
-    progress: Arc<AtomicU64>,
+    progress: Arc<Progress>,
     cancel: Arc<AtomicBool>,
     result: Mutex<Option<std::result::Result<VerificationReport, String>>>,
 }
@@ -144,12 +157,34 @@ impl Runtime {
             latency_us: AtomicU64::new(0),
             rates: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
-            job_slots: Arc::new(Semaphore::new(config.mcp.max_verification_jobs)),
+            job_slots: Arc::new(Semaphore::new(
+                config
+                    .mcp
+                    .max_verification_jobs
+                    .min(config.verification.max_concurrency),
+            )),
             job_handles: tokio::sync::Mutex::new(vec![]),
         })
     }
     pub fn status(&self) -> McpStatus {
+        self.status_inner(None)
+    }
+    pub(crate) fn status_for(&self, principal_key: [u8; 32]) -> McpStatus {
+        self.status_inner(Some(principal_key))
+    }
+    fn status_inner(&self, principal_key: Option<[u8; 32]>) -> McpStatus {
         let calls = self.calls.load(Ordering::Relaxed);
+        let jobs = self.jobs.lock();
+        let active_verifications: Vec<_> = jobs
+            .values()
+            .filter(|j| j.result.lock().is_none())
+            .filter(|j| principal_key.is_none_or(|key| j.owner == key))
+            .map(|j| VerificationJobSummary {
+                job_id: j.id.to_string(),
+                segment_id: j.segment.to_string(),
+                progress: j.progress.snapshot(),
+            })
+            .collect();
         McpStatus {
             enabled: self.config.enabled,
             read_only: self.config.read_only,
@@ -163,8 +198,8 @@ impl Runtime {
             } else {
                 self.latency_us.load(Ordering::Relaxed) as f64 / calls as f64 / 1000.
             },
-            verification_jobs: self.config.max_verification_jobs
-                - self.job_slots.available_permits(),
+            verification_jobs: active_verifications.len(),
+            active_verifications,
             rate_rejections: self.rate_rejections.load(Ordering::Relaxed),
             retained_response_bytes: self.config.max_response_memory_mib * 1024 * 1024
                 - self.responses.available_permits(),
@@ -201,6 +236,7 @@ impl Runtime {
         let mut handles = self.job_handles.lock().await;
         for job in self.jobs.lock().values() {
             job.cancel.store(true, Ordering::Release);
+            job.progress.cancel();
         }
         for handle in handles.iter_mut() {
             let _ = handle.await;
@@ -236,7 +272,7 @@ impl Runtime {
             segment: id,
             owner: principal.key,
             created: Instant::now(),
-            progress: Arc::new(AtomicU64::new(0)),
+            progress: Arc::new(Progress::new()),
             cancel: Arc::new(AtomicBool::new(false)),
             result: Mutex::new(None),
         });
@@ -256,6 +292,8 @@ impl Runtime {
             }
             jobs.insert(job.id, job.clone());
         }
+        job.progress.set_bytes_total(info.physical_bytes);
+        job.progress.set_segments_total(1);
         let result =
             json!({"job_id":job.id.to_string(),"segment_id":info.segment_id,"state":"running"});
         let timeout = Duration::from_secs(self.config.verification_timeout_seconds);
@@ -266,10 +304,10 @@ impl Runtime {
             let progress = job.progress.clone();
             let cancel = job.cancel.clone();
             let verified = tokio::task::spawn_blocking(move || {
-                db.verify_segment_bounded(id, progress, cancel, timeout)
+                db.verify_segment_with_progress_bounded(id, progress, cancel, timeout)
             })
             .await;
-            let verified = match verified {
+            let verified: std::result::Result<VerificationReport, String> = match verified {
                 Ok(Ok(report)) => Ok(report),
                 _ => Err(if retained_job.cancel.load(Ordering::Acquire) {
                     "verification cancelled".into()
@@ -277,6 +315,13 @@ impl Runtime {
                     "verification failed or timed out; inspect server logs".into()
                 }),
             };
+            match &verified {
+                Ok(_) => retained_job.progress.finish(),
+                Err(_) if retained_job.cancel.load(Ordering::Acquire) => {
+                    retained_job.progress.cancel()
+                }
+                Err(error) => retained_job.progress.fail(error),
+            }
             *retained_job.result.lock() = Some(verified);
         });
         handles.retain(|h| !h.is_finished());
@@ -307,9 +352,10 @@ impl Runtime {
             job_id: job.id.to_string(),
             segment_id: job.segment.to_string(),
             state: state.into(),
-            verified_bytes: job.progress.load(Ordering::Relaxed),
+            verified_bytes: job.progress.snapshot().bytes_scanned,
             report,
-            error
+            error,
+            progress: job.progress.snapshot(),
         }))
     }
 }
@@ -438,8 +484,8 @@ impl Handler {
                 let info = self.store.segment_info(id).await.map_err(storage_error)?;
                 let known=self.store.mcp.jobs.lock().values().filter(|j|j.segment==id).max_by_key(|j|j.created).map(|j| {
                     let result=j.result.lock();
-                    let state=match &*result {None=>"running",Some(Ok(_))=>"completed",Some(Err(_))=>"failed"};
-                    json!({"state":state,"verified_bytes":j.progress.load(Ordering::Relaxed),"report":result.as_ref().and_then(|r|r.as_ref().ok()),"error":result.as_ref().and_then(|r|r.as_ref().err())})
+                    let state=match &*result {None=>"running",Some(Ok(_))=>"completed",Some(Err(_)) if j.cancel.load(Ordering::Acquire)=>"cancelled",Some(Err(_))=>"failed"};
+                    json!({"state":state,"verified_bytes":j.progress.snapshot().bytes_scanned,"progress":j.progress.snapshot(),"report":result.as_ref().and_then(|r|r.as_ref().ok()),"error":result.as_ref().and_then(|r|r.as_ref().err())})
                 });
                 Ok(json!({"segment":info,"known_verification":known}))
             }
@@ -603,6 +649,84 @@ fn tools(config: &Mcp) -> Vec<Tool> {
         ("get_object","Return a complete verified small object as base64; oversized objects return metadata and native HTTP instructions, never truncated bytes.",json!({"hash":hash}),vec!["hash"],true,true),
         ("put_object","Durably store canonical base64 binary bytes through the shared writer. Requires write scope and read_only=false. Content retries deduplicate.",json!({"data_base64":{"type":"string","contentEncoding":"base64","maxLength":(config.max_put_object_kib*1024).div_ceil(3)*4}}),vec!["data_base64"],false,true),
         ("verify_segment","Start a bounded, cancellable integrity scan; requires maintenance scope and allow_verification=true. Does not repair or mutate stored bytes. Returns an ephemeral job id.",json!({"segment_id":id}),vec!["segment_id"],false,false),
-        ("verification_status","Read progress/results for your verification job. Completed history is bounded and may expire.",json!({"job_id":id}),vec!["job_id"],true,true),
+        ("verification_status","Read progress/results for your verification job. The legacy verified_bytes field is cumulative bytes scanned; progress.bytes_verified counts bytes whose payload verification completed. Completed history is bounded and may expire.",json!({"job_id":id}),vec!["job_id"],true,true),
     ].into_iter().map(|(name,description,properties,required,read_only,idempotent)|serde_json::from_value(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read_only,"destructiveHint":false,"idempotentHint":idempotent,"openWorldHint":false}})).expect("static valid tool schema")).collect()
+}
+
+#[cfg(test)]
+mod verification_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_keeps_legacy_job_count_and_exposes_live_progress_collection() {
+        let runtime = Runtime::new(&Config::default());
+        let status = serde_json::to_value(runtime.status()).unwrap();
+        assert_eq!(status["verification_jobs"], 0);
+        assert_eq!(status["active_verifications"], json!([]));
+    }
+
+    #[test]
+    fn verification_status_serializes_progress_state_and_counters() {
+        let progress = Progress::new();
+        progress.phase("verifying segment");
+        progress.add_bytes(4096);
+        progress.add_records(7);
+        progress.add_segments(1);
+        progress.add_verified_bytes(3072);
+        progress.add_verified_segments(1);
+        progress.finish();
+        let status = VerificationStatus {
+            job_id: "job".into(),
+            segment_id: "segment".into(),
+            state: "completed".into(),
+            verified_bytes: progress.snapshot().bytes_scanned,
+            report: None,
+            error: None,
+            progress: progress.snapshot(),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["verified_bytes"], 4096);
+        assert_eq!(value["progress"]["state"], "completed");
+        assert_eq!(value["progress"]["bytes_scanned"], 4096);
+        assert_eq!(value["progress"]["bytes_verified"], 3072);
+        assert_eq!(value["progress"]["segments_verified"], 1);
+        assert_eq!(value["progress"]["records_checked"], 7);
+        assert_eq!(value["progress"]["segments_processed"], 1);
+    }
+
+    #[test]
+    fn scoped_mcp_status_only_lists_the_callers_active_jobs() {
+        let runtime = Runtime::new(&Config::default());
+        let first_owner = [1; 32];
+        let second_owner = [2; 32];
+        let first_job = Uuid::new_v4();
+        let second_job = Uuid::new_v4();
+        {
+            let mut jobs = runtime.jobs.lock();
+            for (id, owner) in [(first_job, first_owner), (second_job, second_owner)] {
+                jobs.insert(
+                    id,
+                    Arc::new(Job {
+                        id,
+                        segment: Uuid::new_v4(),
+                        owner,
+                        created: Instant::now(),
+                        progress: Arc::new(Progress::new()),
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        result: Mutex::new(None),
+                    }),
+                );
+            }
+        }
+        let first = runtime.status_for(first_owner);
+        let second = runtime.status_for(second_owner);
+        assert_eq!(first.verification_jobs, 1);
+        assert_eq!(second.verification_jobs, 1);
+        assert_eq!(first.active_verifications[0].job_id, first_job.to_string());
+        assert_eq!(
+            second.active_verifications[0].job_id,
+            second_job.to_string()
+        );
+        assert_eq!(runtime.status().verification_jobs, 2);
+    }
 }

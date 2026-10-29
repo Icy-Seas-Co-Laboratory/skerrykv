@@ -450,10 +450,22 @@ pub struct Coordinator {
     write_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl Coordinator {
+    /// Constant-time readiness; does not enumerate files or index entries.
+    pub fn is_ready(&self) -> bool {
+        self.accepting.load(Ordering::Acquire) && !self.counters.faulted.load(Ordering::Acquire)
+    }
     pub async fn open(config: Config) -> Result<Arc<Self>> {
+        Self::open_with_progress(config, Arc::new(crate::progress::Progress::new())).await
+    }
+    pub async fn open_with_progress(
+        config: Config,
+        progress: Arc<crate::progress::Progress>,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
         let c = config.clone();
-        let store = Arc::new(tokio::task::spawn_blocking(move || Store::open(&c)).await??);
+        let store = Arc::new(
+            tokio::task::spawn_blocking(move || Store::open_with_progress(&c, &progress)).await??,
+        );
         let (write_tx, write_rx) = mpsc::channel(config.writes.batch_max_records * 2);
         let (read_tx, read_rx) = mpsc::channel(config.reads.queue_items);
         let counters = Arc::new(Counters::default());

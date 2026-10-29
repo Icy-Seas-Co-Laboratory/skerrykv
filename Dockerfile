@@ -17,6 +17,6 @@ ENV SKERRY_MCP_ENABLED=false
 ENV SKERRY_CONFIG=/var/lib/skerry/config.toml
 EXPOSE 7788
 VOLUME ["/var/lib/skerry"]
-HEALTHCHECK --interval=20s --timeout=3s --start-period=10s --retries=3 CMD ["skerry", "health", "--url", "http://127.0.0.1:7788"]
+HEALTHCHECK --interval=20s --timeout=3s --start-period=10s --retries=3 CMD ["skerry", "ready", "--url", "http://127.0.0.1:7788"]
 ENTRYPOINT ["/usr/local/bin/skerry"]
 CMD ["serve", "--config", "/var/lib/skerry/config.toml"]

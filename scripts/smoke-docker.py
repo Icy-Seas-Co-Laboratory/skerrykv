@@ -35,7 +35,7 @@ def main():
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             try:
-                if call("GET", "/v1/health")[0] == 200:
+                if call("GET", "/v1/ready")[0] == 200:
                     docker("exec", name, "skerry", "health", "--url", "http://127.0.0.1:7788")
                     return
             except (OSError, http.client.HTTPException):

@@ -998,7 +998,7 @@ async fn trace_diagnostics_never_include_mcp_payloads_or_credentials() {
             panic!("diagnostic test service exited early");
         }
         if client
-            .get(format!("{url}/v1/health"))
+            .get(format!("{url}/v1/ready"))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())
@@ -1251,7 +1251,7 @@ async fn acknowledged_mcp_put_survives_forced_service_process_termination() {
         async move {
             for _ in 0..200 {
                 if client
-                    .get(format!("{url}/v1/health"))
+                    .get(format!("{url}/v1/ready"))
                     .send()
                     .await
                     .is_ok_and(|r| r.status().is_success())

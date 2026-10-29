@@ -1,0 +1,139 @@
+{
+  "baseline": {
+    "name": "skerry",
+    "version": "skerry 0.2.1",
+    "sha256": "c717555df4e2b431387d627502165532bf73a5833b20b941ee1dc0b02aaaaafa"
+  },
+  "candidate": {
+    "name": "skerry",
+    "version": "skerry 0.2.1",
+    "sha256": "fecdb1cdebcf69475dfa055e3509f721d505e7b681af84a032c1edcc08624807"
+  },
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "method": "alternating executables; warmup excluded; OS cache not evicted; wall time includes CLI and private index reconstruction; isolated temporary stores",
+  "scenarios": [
+    {
+      "name": "small_objects",
+      "objects_written": 2048,
+      "payload_bytes": 8388608,
+      "deleted": 0,
+      "seconds": {
+        "baseline": [
+          0.4310835839714855,
+          0.44529816694557667,
+          0.4272243750747293
+        ],
+        "candidate": [
+          0.3976832078769803,
+          0.3486822091508657,
+          0.3517758750822395
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.4310835839714855,
+        "candidate": 0.3517758750822395
+      },
+      "speedup": 1.2254495390586553,
+      "candidate_progress": {
+        "state": "completed",
+        "phase": "scanning segments",
+        "bytes_scanned": 8519840,
+        "bytes_verified": 8388608,
+        "segments_verified": 1,
+        "bytes_total": 8519840,
+        "records_checked": 2048,
+        "segments_processed": 1,
+        "segments_total": 1,
+        "journal_bytes": 520363,
+        "transactions_processed": 68,
+        "index_entries_compared": 2049,
+        "index_bytes_copied": 315724,
+        "elapsed_seconds": 0.343080708,
+        "bytes_per_second": 24833340.38123764,
+        "failures": []
+      }
+    },
+    {
+      "name": "large_objects",
+      "objects_written": 256,
+      "payload_bytes": 134217728,
+      "deleted": 0,
+      "seconds": {
+        "baseline": [
+          0.5759238749742508,
+          0.5590687079820782,
+          0.5496214579325169
+        ],
+        "candidate": [
+          0.46950479107908905,
+          0.48360354197211564,
+          0.456621624995023
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.5590687079820782,
+        "candidate": 0.46950479107908905
+      },
+      "speedup": 1.1907625195839628,
+      "candidate_progress": {
+        "state": "completed",
+        "phase": "scanning segments",
+        "bytes_scanned": 134234272,
+        "bytes_verified": 134217728,
+        "segments_verified": 1,
+        "bytes_total": 134234272,
+        "records_checked": 256,
+        "segments_processed": 1,
+        "segments_total": 1,
+        "journal_bytes": 69952,
+        "transactions_processed": 18,
+        "index_entries_compared": 257,
+        "index_bytes_copied": 50180,
+        "elapsed_seconds": 0.44909325,
+        "bytes_per_second": 298900667.06636095,
+        "failures": []
+      }
+    },
+    {
+      "name": "deletion_churn",
+      "objects_written": 256,
+      "payload_bytes": 1048576,
+      "deleted": 128,
+      "seconds": {
+        "baseline": [
+          0.4394165419507772,
+          0.4478746661916375,
+          0.47227208386175334
+        ],
+        "candidate": [
+          0.34359929198399186,
+          0.38342495798133314,
+          0.38257004180923104
+        ]
+      },
+      "median_seconds": {
+        "baseline": 0.4478746661916375,
+        "candidate": 0.38257004180923104
+      },
+      "speedup": 1.1706997863020614,
+      "candidate_progress": {
+        "state": "completed",
+        "phase": "scanning segments",
+        "bytes_scanned": 1065120,
+        "bytes_verified": 1048576,
+        "segments_verified": 1,
+        "bytes_total": 1065120,
+        "records_checked": 256,
+        "segments_processed": 1,
+        "segments_total": 1,
+        "journal_bytes": 147286,
+        "transactions_processed": 138,
+        "index_entries_compared": 257,
+        "index_bytes_copied": 106272,
+        "elapsed_seconds": 0.367381875,
+        "bytes_per_second": 2899217.6056589615,
+        "failures": []
+      }
+    }
+  ]
+}

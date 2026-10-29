@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Request, State},
+    extract::{Extension, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -176,8 +176,11 @@ pub fn router(
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state))
 }
-async fn mcp_status(State(state): State<Guard>) -> axum::Json<crate::mcp::McpStatus> {
-    axum::Json(state.store.mcp.status())
+async fn mcp_status(
+    State(state): State<Guard>,
+    Extension(principal): Extension<Principal>,
+) -> axum::Json<crate::mcp::McpStatus> {
+    axum::Json(state.store.mcp.status_for(principal.key))
 }
 async fn guard(State(state): State<Guard>, mut request: Request, next: Next) -> Response {
     let runtime = state.store.mcp.clone();
