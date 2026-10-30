@@ -96,6 +96,7 @@ fn vacuum_dry_run_preserves_every_store_file_and_full_vacuum_preserves_fences() 
     let source_config = Config {
         storage: skerrykv::config::Storage {
             root: source.clone(),
+            ..config.storage.clone()
         },
         ..config.clone()
     };

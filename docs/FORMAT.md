@@ -1,4 +1,4 @@
-# SkerryKV binary storage formats, versions 1 and 2
+# SkerryKV storage formats and writer capabilities, versions 1–3
 
 All integers are unsigned and little-endian. UUIDs are their 16 RFC 4122 bytes,
 not host-endian integers; digests are the 32 raw BLAKE3 bytes. Timestamps are Unix
@@ -277,3 +277,11 @@ b548c558465d79db03fd359c6cd5bd9d850000000000000000dde8f237
 
 Line breaks above are presentation only. Both vectors decode to 64 bytes.
 Unit tests compare the exact encoded bytes against these independent vectors.
+
+## Version 3 multi-lane capability
+
+Version 3 retains the physical segment headers, record headers, footers, metadata encoding, and version-2 journal framing described above. Its activation has `version:3` and requires a journal. The checksummed `format-v2` root marker retains its filename but carries the version-3 activation. Old engines that understand only activation versions 1 and 2 reject it before opening the index.
+
+Version 3 permits up to eight active segment slots. A segment's first UUID byte modulo eight identifies its slot. New active UUIDs are generated for the intended slot; sealed streaming segments remain ordinary immutable segments. Each slot's indexed/journaled end is its committed prefix; recovery truncates unacknowledged bytes independently. Slot ownership is not derived from the current configured writer count, so changing that count does not invalidate existing objects or active tails.
+
+Activating more than one writer lane upgrades the capability under exclusive store ownership. Future activations, rebuilds, checkpoints, and vacuum retain version 3 even when the configured count returns to one. An ordinary one-lane version-2 store remains version 2. Legacy version-1 stores still require explicit upgrade. See [configuration and lifecycle](MULTI_WRITER.md).

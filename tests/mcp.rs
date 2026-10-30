@@ -1060,15 +1060,40 @@ async fn trace_diagnostics_never_include_mcp_payloads_or_credentials() {
 }
 
 #[tokio::test]
-async fn native_and_mcp_requests_share_the_global_http_admission_limit() {
-    let fixture = Fixture::new(|c| c.resources.max_requests = 1, Credentials::default()).await;
+async fn native_data_and_mcp_share_admission_but_status_remains_available() {
+    let fixture = Fixture::new(
+        |c| {
+            c.resources.max_requests = 1;
+            c.resources.admission_timeout_ms = 50;
+        },
+        Credentials::default(),
+    )
+    .await;
+    let hash = fixture
+        .coordinator
+        .put(Bytes::from_static(b"held response"))
+        .await
+        .unwrap()
+        .hash;
     let held = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/objects/{}", hex::encode(hash)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let monitor = fixture
         .router
         .clone()
         .oneshot(Request::get("/v1/status").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(held.status(), StatusCode::OK);
+    assert_eq!(monitor.status(), StatusCode::OK);
+    drop(monitor);
     let (status, _) = fixture.request("tools/list", json!({}), None).await;
     assert_eq!(
         status,

@@ -22,6 +22,28 @@ if a request times out or disconnects, the outcome is unknown and the operation
 continues. Check `skerry status --json` for `gc.running`, `gc.last_result` and
 `gc.last_error`; a subsequent pass is safe.
 
+V2 journal checkpointing is enabled by default. It runs every
+`checkpoint.interval_seconds` when journal growth since the prior checkpoint
+reaches `checkpoint.min_journal_mib`. The service validates a snapshot against
+the journal authority, copies changes made during the snapshot, then holds the
+writer only for the bounded final suffix and durable activation. It removes the
+old journal only after activation succeeds. See the checkpoint safety and disk
+headroom details in [PERFORMANCE_UPGRADE.md](PERFORMANCE_UPGRADE.md).
+
+To request a checkpoint immediately, use the service administrator token:
+
+```sh
+curl -H "Authorization: Bearer $SKERRY_TOKEN" \
+  -X POST 'http://127.0.0.1:7788/v1/admin/checkpoint?force=true'
+```
+
+This HTTP route requires `SKERRY_TOKEN`; MCP scoped read, write, and maintenance
+credentials do not authorize it. `force=true` bypasses the minimum journal-growth
+threshold, but not correctness checks or the free-space reserve. Check
+`GET /v1/status` for `checkpoint.running`, progress, `last_result`, and
+`last_error`. The optional dedicated admin listener does not expose checkpoint
+operations, so send this request to the primary listener.
+
 Stop the service before running offline operations against its store. Each
 operation acquires exclusive access and refuses a concurrently open store:
 
@@ -90,4 +112,4 @@ A small three-trial comparison on the same Mac used identical 128-object fixture
 
 [Raw comparison](V2_PROTOCOL_BENCHMARK.json) includes timings and executable hashes; `scripts/benchmark-protocol-v2.py` reproduces the workload. V2 adds mutation-frame and witness synchronization ahead of the existing index synchronization. Its additional durable write barriers cost throughput here; batching remains important. Duplicate/read differences are not isolated causal estimates. Earlier v0.1 benchmark gains must not be advertised as v0.2 performance.
 
-The next improvements should be incremental compaction for sources larger than a pass budget, candidate-scan/time limits with resumable progress, and periodic safe journal checkpoints to bound mutation history and first-open migration recovery (normal startup uses the persisted replay cursor). Vacuum already compacts the journal and index. Tombstones remain retained to fence old imports; they must not be dropped merely by age. New durability-barrier optimizations require crash tests and remeasurement.
+V0.3.0 adds periodic v2 journal checkpoints to bound journal growth; this does not replace the journal as recovery authority or remove tombstones needed to fence old imports. Tombstones must not be dropped merely by age. Future durability-barrier changes still require crash tests and remeasurement.

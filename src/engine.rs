@@ -18,8 +18,18 @@ use std::{
 };
 use uuid::Uuid;
 mod indexes;
+mod lanes;
+pub(crate) use lanes::PreparedPut;
+pub use lanes::WriteLaneTimingSnapshot;
 mod maintenance;
+mod timings;
+pub use timings::WriteTimingSnapshot;
+mod space;
+mod streaming;
 use maintenance::{Journal, Mutation};
+pub use space::StorageFull;
+pub(crate) use streaming::PreparedStreamUpload;
+pub use streaming::{StreamRead, StreamUpload};
 
 pub const SEGMENT_HEADER: u64 = 64;
 pub const RECORD_HEADER: u64 = 64;
@@ -51,6 +61,8 @@ pub struct StorageStatus {
     pub physical_bytes: u64,
     pub segments: usize,
     pub active_segment: Option<String>,
+    #[serde(default)]
+    pub active_segments: Vec<String>,
     pub active_bytes: u64,
     pub index_bytes: u64,
     pub open_files: usize,
@@ -109,11 +121,22 @@ pub struct Store {
     root: PathBuf,
     config: Config,
     writer: Mutex<Writer>,
+    publication_fault: AtomicBool,
+    append_lanes: Vec<Mutex<Writer>>,
+    lane_timings: Vec<lanes::LaneTimings>,
+    lane_barrier: RwLock<()>,
+    commit_queue: Mutex<lanes::CommitQueue>,
+    commit_changed: Condvar,
+    multi_writer: bool,
+    #[cfg(test)]
+    lane_pause: Mutex<Option<Arc<lanes::LanePause>>>,
     visibility: RwLock<()>,
     files: Mutex<FileCache>,
     files_available: Condvar,
+    stream_checksums: Mutex<streaming::ChecksumCache>,
     object_count: AtomicU64,
     verification_control: crate::verification::Control,
+    write_timings: timings::WriteTimings,
     gc_pressure: AtomicBool,
     journal: Option<Mutex<Journal>>,
     tombstones: Keyspace,
@@ -433,12 +456,12 @@ fn read_activation(path: &Path) -> Result<Activation> {
     );
     let a: Activation = serde_json::from_slice(&b[..b.len() - 4])?;
     ensure!(
-        (a.version == 1 || a.version == 2)
+        (1..=3).contains(&a.version)
             && a.generation.starts_with("generation-")
             && Path::new(&a.generation).components().count() == 1,
         "invalid activation record"
     );
-    if a.version == 2 {
+    if a.version >= 2 {
         let journal = a
             .journal
             .as_ref()
@@ -464,15 +487,25 @@ fn selected_activation(root: &Path) -> Result<Option<Activation>> {
     match (indexed, fallback) {
         (Some(a), Some(marker)) => {
             ensure!(
-                marker.version == 2 && a.version == 2,
+                marker.version >= 2 && a.version >= 2,
                 "activation contradicts v2 root marker; refusing format rollback"
             );
             if a.sequence == marker.sequence {
                 ensure!(
-                    a.generation == marker.generation && a.journal == marker.journal,
+                    a.version == marker.version
+                        && a.generation == marker.generation
+                        && a.journal == marker.journal,
                     "conflicting activation records at same sequence"
                 );
             }
+            ensure!(
+                if marker.sequence > a.sequence {
+                    marker.version >= a.version
+                } else {
+                    a.version >= marker.version
+                },
+                "activation feature rollback is not supported"
+            );
             Ok(Some(if marker.sequence > a.sequence {
                 marker
             } else {
@@ -513,14 +546,28 @@ fn activate(root: &Path, generation: &Path) -> Result<()> {
     activate_version(root, generation, None)
 }
 fn activate_version(root: &Path, generation: &Path, journal: Option<&str>) -> Result<()> {
+    activate_feature_version(root, generation, journal, None)
+}
+fn activate_feature_version(
+    root: &Path,
+    generation: &Path,
+    journal: Option<&str>,
+    feature: Option<u8>,
+) -> Result<()> {
     let index = root.join("index");
     fs::create_dir_all(&index)?;
-    let sequence = selected_activation(root)?
+    let selected = selected_activation(root)?;
+    let previous_version = selected.as_ref().map_or(1, |a| a.version);
+    let sequence = selected
         .map_or(0, |a| a.sequence)
         .checked_add(1)
         .context("activation sequence exhausted")?;
     let a = Activation {
-        version: if journal.is_some() { 2 } else { 1 },
+        version: feature.unwrap_or(if journal.is_some() {
+            previous_version.max(2)
+        } else {
+            1
+        }),
         journal: journal.map(str::to_owned),
         generation: generation
             .file_name()
@@ -901,6 +948,12 @@ impl Store {
         let root = config.storage.root.clone();
         let lock = store_lock(&root)?;
         if repair {
+            maintenance::cleanup_checkpoint_work(&root)?;
+        }
+        if repair {
+            streaming::cleanup_uploads(&root)?;
+        }
+        if repair {
             fs::create_dir_all(root.join("segments"))?;
             fs::create_dir_all(root.join("logs"))?;
         }
@@ -925,7 +978,7 @@ impl Store {
             Some(Journal::create(&root)?)
         } else {
             selected_activation(&root)?
-                .filter(|a| a.version == 2)
+                .filter(|a| a.version >= 2)
                 .map(|a| {
                     if repair {
                         Journal::open_fast(&root, a.journal.as_deref().unwrap())
@@ -947,6 +1000,12 @@ impl Store {
                 journal.as_ref().map(|j| j.name.as_str()),
             )?;
         }
+        let multi_writer = config.writes.writer_lanes > 1
+            || selected_activation(&root)?.is_some_and(|a| a.version >= 3);
+        ensure!(
+            !multi_writer || journal.is_some(),
+            "multiple writer lanes require an explicitly upgraded v2 store"
+        );
         let store = Self {
             db,
             objects,
@@ -954,14 +1013,25 @@ impl Store {
             root,
             config: config.clone(),
             writer: Mutex::new(Writer::default()),
+            publication_fault: AtomicBool::new(false),
+            append_lanes: lanes::new_lanes(),
+            lane_timings: lanes::new_timings(),
+            lane_barrier: RwLock::new(()),
+            commit_queue: Mutex::new(lanes::CommitQueue::default()),
+            commit_changed: Condvar::new(),
+            multi_writer,
+            #[cfg(test)]
+            lane_pause: Mutex::new(None),
             visibility: RwLock::new(()),
             files: Mutex::new(FileCache {
                 entries: VecDeque::new(),
                 max: config.resources.max_open_segments,
             }),
             files_available: Condvar::new(),
+            stream_checksums: Mutex::new(streaming::ChecksumCache::default()),
             object_count: AtomicU64::new(0),
             verification_control: crate::verification::Control::default(),
+            write_timings: timings::WriteTimings::default(),
             gc_pressure: AtomicBool::new(false),
             journal: journal.map(Mutex::new),
             tombstones,
@@ -977,6 +1047,13 @@ impl Store {
             store.cleanup_retired()?;
         }
         store.recover(repair, progress)?;
+        if repair
+            && multi_writer
+            && selected_activation(&store.root)?.is_some_and(|a| a.version < 3)
+        {
+            let journal = store.journal.as_ref().unwrap().lock();
+            activate_feature_version(&store.root, &generation, Some(&journal.name), Some(3))?;
+        }
         Ok(store)
     }
     fn verify_offline_scan(
@@ -1218,9 +1295,15 @@ impl Store {
                     if sealed && repair {
                         self.publish(&[Mutation::segment(&meta)])?;
                     } else if !sealed {
+                        let mut lane = if self.multi_writer {
+                            Some(self.append_lanes[lanes::segment_lane(id)].lock())
+                        } else {
+                            None
+                        };
+                        let target = lane.as_mut().map_or(&mut *writer, |guard| &mut **guard);
                         ensure!(
-                            writer.active.is_none(),
-                            "multiple active segments in single-volume store"
+                            target.active.is_none(),
+                            "multiple active segments for one writer lane"
                         );
                         if repair && (physical != meta.end || meta.physical != meta.end) {
                             file.set_len(meta.end)?;
@@ -1229,7 +1312,7 @@ impl Store {
                             self.publish(&[Mutation::segment(&meta)])?;
                         }
                         file.seek(SeekFrom::Start(meta.end))?;
-                        writer.active = Some(Active {
+                        target.active = Some(Active {
                             file,
                             meta: meta.clone(),
                         });
@@ -1349,6 +1432,9 @@ impl Store {
         Ok(())
     }
     pub fn put_many(&self, payloads: &[Bytes]) -> Result<Vec<PutResult>> {
+        if self.multi_writer {
+            return self.put_partitioned(payloads);
+        }
         ensure!(
             payloads.len() <= self.config.writes.batch_max_records,
             "write batch exceeds configured record limit"
@@ -1365,17 +1451,43 @@ impl Store {
                 "object does not fit segment"
             );
         }
+        // Hash before taking the writer lock. Besides avoiding repeated hashing
+        // inside the critical section, this lets the complete batch reserve be
+        // checked before the first segment append.
+        let hashes: Vec<[u8; 32]> = payloads
+            .iter()
+            .map(|payload| *blake3::hash(payload).as_bytes())
+            .collect();
+        self.put_legacy_hashed(payloads, &hashes)
+    }
+    fn put_legacy_hashed(&self, payloads: &[Bytes], hashes: &[[u8; 32]]) -> Result<Vec<PutResult>> {
         let mut writer = self.writer.lock();
         ensure!(
-            !writer.faulted,
+            !writer.faulted && !self.publication_fault.load(Ordering::Acquire),
             "write coordinator faulted; restart and recover before writing"
         );
+        let mut new_hashes = HashSet::new();
+        let mut required_space = 0u64;
+        for (payload, hash) in payloads.iter().zip(hashes) {
+            if !new_hashes.insert(*hash) || self.objects.contains_key(*hash)? {
+                continue;
+            }
+            required_space = required_space
+                .checked_add(payload.len() as u64)
+                .and_then(|n| n.checked_add(RECORD_HEADER))
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(|| anyhow::anyhow!("write batch space estimate overflow"))?;
+        }
+        if required_space > 0 {
+            self.ensure_write_space(required_space)?;
+        }
+        let mut failure = maintenance::PublicationFailureGuard::new(&self.publication_fault);
         let result = (|| {
             let mut results = vec![];
             let mut pending: Vec<([u8; 32], Location)> = vec![];
             let mut seen = HashSet::new();
-            for p in payloads {
-                let hash = *blake3::hash(p).as_bytes();
+            for (p, hash) in payloads.iter().zip(hashes) {
+                let hash = *hash;
                 if self.objects.contains_key(hash)? || !seen.insert(hash) {
                     results.push(PutResult {
                         hash,
@@ -1404,11 +1516,16 @@ impl Store {
                     a.file.set_len(capacity)?;
                     a.meta.physical = capacity;
                 }
+                let append_started = Instant::now();
                 a.file.seek(SeekFrom::Start(a.meta.end))?;
                 a.file.write_all(&record_header(p, &hash))?;
                 failpoint("after_record_header")?;
                 let offset = a.meta.end + 64;
                 a.file.write_all(p)?;
+                self.lane_timings[0].append_us.fetch_add(
+                    append_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 failpoint("after_payload")?;
                 a.meta.end = offset + p.len() as u64;
                 a.meta.physical = a.meta.physical.max(a.meta.end);
@@ -1433,6 +1550,8 @@ impl Store {
         })();
         if result.is_err() {
             writer.faulted = true;
+        } else {
+            failure.complete();
         }
         result
     }
@@ -1448,7 +1567,19 @@ impl Store {
             .active
             .as_mut()
             .context("no active segment for pending writes")?;
-        a.file.sync_all()?;
+        let started = Instant::now();
+        let synced = a.file.sync_all();
+        let elapsed = started.elapsed().as_micros() as u64;
+        self.lane_timings[0]
+            .data_sync_us
+            .fetch_add(elapsed, Ordering::Relaxed);
+        self.write_timings
+            .data_sync_us
+            .fetch_add(elapsed, Ordering::Relaxed);
+        self.write_timings
+            .data_sync_calls
+            .fetch_add(1, Ordering::Relaxed);
+        synced?;
         failpoint("after_segment_sync")?;
         let _visible = self.visibility.write();
         let mut changes: Vec<_> = pending
@@ -1460,7 +1591,11 @@ impl Store {
             .collect();
         changes.push(Mutation::segment(&a.meta));
         failpoint("before_index_commit")?;
+        let committed = Instant::now();
         self.publish(&changes)?;
+        self.lane_timings[0]
+            .commit_wait_us
+            .fetch_add(committed.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.object_count
             .fetch_add(pending.len() as u64, Ordering::Relaxed);
         failpoint("after_index_sync")?;
@@ -1470,13 +1605,23 @@ impl Store {
     /// Probe only when no writer is publishing. Index visibility alone is not
     /// sufficient: a failed journal sync can leave an unacknowledged mapping.
     /// A busy writer falls back to the normal coordinated write path.
+    #[cfg(test)]
     pub(crate) fn committed_duplicate(&self, payload: &[u8]) -> Result<Option<PutResult>> {
         let hash = *blake3::hash(payload).as_bytes();
+        self.committed_hash_duplicate(hash)
+    }
+    pub(crate) fn committed_prepared_duplicate(
+        &self,
+        payload: &PreparedPut,
+    ) -> Result<Option<PutResult>> {
+        self.committed_hash_duplicate(payload.hash())
+    }
+    fn committed_hash_duplicate(&self, hash: [u8; 32]) -> Result<Option<PutResult>> {
         let Some(writer) = self.writer.try_lock() else {
             return Ok(None);
         };
         ensure!(
-            !writer.faulted,
+            !writer.faulted && !self.publication_fault.load(Ordering::Acquire),
             "write coordinator faulted; restart and recover before writing"
         );
         Ok(self.exists(&hash)?.then_some(PutResult {
@@ -1974,20 +2119,27 @@ impl Store {
             status.payload_bytes += meta.live;
             status.physical_bytes += fs::metadata(segment_path(&self.root, &meta))?.len();
             if meta.state == 0 {
-                status.active_segment = Some(meta.id.to_string());
-                status.active_bytes = meta.end;
+                if status.active_segment.is_none() {
+                    status.active_segment = Some(meta.id.to_string());
+                }
+                status.active_segments.push(meta.id.to_string());
+                status.active_bytes += meta.end;
                 status.open_files += 1;
             }
         }
         Ok(status)
     }
     pub fn sync(&self) -> Result<()> {
+        if self.multi_writer {
+            return self.sync_lanes(false);
+        }
         let mut writer = self.writer.lock();
         ensure!(
-            !writer.faulted,
+            !writer.faulted && !self.publication_fault.load(Ordering::Acquire),
             "write coordinator faulted; final synchronization cannot be reported as successful"
         );
         let _visible = self.visibility.write();
+        let mut failure = maintenance::PublicationFailureGuard::new(&self.publication_fault);
         let result = (|| {
             if let Some(a) = &writer.active {
                 a.file.sync_all()?;
@@ -1997,15 +2149,26 @@ impl Store {
         })();
         if result.is_err() {
             writer.faulted = true;
+        } else {
+            failure.complete();
         }
         result
     }
     pub fn seal(&self) -> Result<()> {
+        if self.multi_writer {
+            return self.sync_lanes(true);
+        }
         let mut writer = self.writer.lock();
-        ensure!(!writer.faulted, "write coordinator faulted");
+        ensure!(
+            !writer.faulted && !self.publication_fault.load(Ordering::Acquire),
+            "write coordinator faulted"
+        );
+        let mut failure = maintenance::PublicationFailureGuard::new(&self.publication_fault);
         let result = self.seal_locked(&mut writer);
         if result.is_err() {
             writer.faulted = true;
+        } else {
+            failure.complete();
         }
         result
     }
@@ -2056,7 +2219,7 @@ fn verify_progress(
     }
     // Verify committed bytes under exclusive ownership, without truncating or adopting tails.
     ensure!(config.storage.root.is_dir(), "store does not exist");
-    if selected_activation(&config.storage.root)?.is_some_and(|a| a.version == 2) {
+    if selected_activation(&config.storage.root)?.is_some_and(|a| a.version >= 2) {
         return maintenance::verify_v2(config, progress);
     }
     maintenance::verify_v1(config, progress)
@@ -2067,7 +2230,7 @@ pub fn rebuild(config: &Config, salvage: bool) -> Result<serde_json::Value> {
     let root = &config.storage.root;
     let _lock = store_lock(root)?;
     if let Some(a) = selected_activation(root)?
-        && a.version == 2
+        && a.version >= 2
     {
         return maintenance::rebuild_v2(config, a);
     }

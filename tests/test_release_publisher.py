@@ -95,7 +95,7 @@ class PublisherTests(unittest.TestCase):
             if '/git/ref/' in endpoint:
                 return {'object': {'type': 'commit', 'sha': COMMIT}}
             if endpoint.endswith('/latest'):
-                return {'tag_name': 'v0.3.0'}
+                return {'tag_name': f"v{int(VERSION.split('.')[0]) + 1}.0.0"}
             count = sum(1 for c in calls if c == ('api', endpoint))
             return {'draft': True, 'target_commitish': COMMIT, 'assets': [] if count == 1 else self.asset_metadata(self.dist.iterdir())}
         def gh(*args, **kwargs):

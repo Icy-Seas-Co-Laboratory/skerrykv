@@ -2,6 +2,10 @@
 //! records alone are deliberately insufficient to reconstruct a deleted object.
 use super::*;
 use serde_json::{Value, json};
+mod checkpoints;
+pub(super) fn cleanup_checkpoint_work(root: &Path) -> Result<()> {
+    checkpoints::cleanup_interrupted(root)
+}
 
 const JOURNAL_HEADER: u64 = 128;
 const JOURNAL_MAGIC: &[u8; 8] = b"SKRYJNL2";
@@ -348,6 +352,13 @@ impl Journal {
         Ok(offset)
     }
     fn append(&mut self, changes: &[Mutation]) -> Result<()> {
+        self.append_timed(changes, None)
+    }
+    fn append_timed(
+        &mut self,
+        changes: &[Mutation],
+        timings: Option<&timings::WriteTimings>,
+    ) -> Result<()> {
         let body = serde_json::to_vec(changes)?;
         ensure!(
             !body.is_empty() && body.len() <= MAX_FRAME,
@@ -363,10 +374,24 @@ impl Journal {
         failpoint("journal_before_commit")?;
         self.file.write_all(COMMIT)?;
         self.file.write_all(&crc32fast::hash(&body).to_le_bytes())?;
-        self.file.sync_all()?;
+        let started = Instant::now();
+        let synced = self.file.sync_all();
+        if let Some(t) = timings {
+            t.journal_sync_us
+                .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            t.journal_sync_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        synced?;
         failpoint("journal_after_frame_sync")?;
         let end = self.file.stream_position()?;
-        self.write_witness(end)?;
+        let started = Instant::now();
+        let synced = self.write_witness(end);
+        if let Some(t) = timings {
+            t.witness_sync_us
+                .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            t.witness_sync_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        synced?;
         failpoint("after_mutation_sync")?;
         Ok(())
     }
@@ -634,6 +659,29 @@ fn apply(
     batch.commit()?;
     Ok(())
 }
+pub(super) struct PublicationFailureGuard<'a> {
+    flag: &'a AtomicBool,
+    completed: bool,
+}
+impl<'a> PublicationFailureGuard<'a> {
+    pub(super) fn new(flag: &'a AtomicBool) -> Self {
+        Self {
+            flag,
+            completed: false,
+        }
+    }
+    pub(super) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for PublicationFailureGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.flag.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl Store {
     pub(super) fn startup_object_count(&self) -> Result<u64> {
         let recovery = self
@@ -650,12 +698,21 @@ impl Store {
         Ok(count)
     }
     pub(super) fn publish(&self, changes: &[Mutation]) -> Result<()> {
+        ensure!(
+            !self.publication_fault.load(Ordering::Acquire),
+            "publication path faulted; restart and recover before writing"
+        );
+        let mut failure = PublicationFailureGuard {
+            flag: &self.publication_fault,
+            completed: false,
+        };
         if changes.is_empty() {
+            failure.completed = true;
             return Ok(());
         }
         let mut journal = self.journal.as_ref().map(|journal| journal.lock());
         if let Some(journal) = &mut journal {
-            journal.append(changes)?;
+            journal.append_timed(changes, Some(&self.write_timings))?;
         }
         let cursor = journal
             .as_ref()
@@ -663,6 +720,7 @@ impl Store {
                 Ok::<_, anyhow::Error>((journal.name.as_str(), journal.file.metadata()?.len()))
             })
             .transpose()?;
+        let applied = Instant::now();
         apply(
             &self.db,
             &self.objects,
@@ -672,9 +730,32 @@ impl Store {
             changes,
             ApplyMode::Durable(cursor),
         )?;
+        self.write_timings
+            .index_apply_us
+            .fetch_add(applied.elapsed().as_micros() as u64, Ordering::Relaxed);
         failpoint("after_index_commit")?;
-        self.db.persist(PersistMode::SyncAll)?;
+        #[cfg(test)]
+        self.pause_publication()?;
+        let started = Instant::now();
+        let persisted = self.db.persist(PersistMode::SyncAll);
+        self.write_timings
+            .index_persist_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.write_timings
+            .index_persist_calls
+            .fetch_add(1, Ordering::Relaxed);
+        persisted?;
+        failure.completed = true;
         Ok(())
+    }
+    pub fn format_version(&self) -> u8 {
+        if self.multi_writer {
+            3
+        } else if self.journal.is_some() {
+            2
+        } else {
+            1
+        }
     }
     pub fn deletion_enabled(&self) -> bool {
         self.journal.is_some()
@@ -736,9 +817,20 @@ impl Store {
     }
     pub fn upgrade(config: &Config) -> Result<Value> {
         ensure!(config.storage.root.is_dir(), "store does not exist");
-        let store = Self::open(config)?;
+        // A legacy store must first be opened with its single-writer
+        // invariant before publishing the journal/feature activation.
+        let mut opening = config.clone();
+        opening.writes.writer_lanes = 1;
+        let store = Self::open(&opening)?;
         if store.deletion_enabled() {
-            return Ok(json!({"status":"already_v2","version":2}));
+            let mut version = store.format_version();
+            if config.writes.writer_lanes > 1 && version < 3 {
+                let generation = selected_generation(&store.root)?.context("missing generation")?;
+                let journal = store.journal.as_ref().unwrap().lock();
+                activate_feature_version(&store.root, &generation, Some(&journal.name), Some(3))?;
+                version = 3;
+            }
+            return Ok(json!({"status":"already_v2","version":version}));
         }
         let mut journal = Journal::create(&store.root)?;
         checkpoint(
@@ -751,8 +843,9 @@ impl Store {
         )?;
         failpoint("upgrade_before_activation")?;
         let generation = selected_generation(&store.root)?.context("missing generation")?;
-        activate_version(&store.root, &generation, Some(&journal.name))?;
-        Ok(json!({"status":"upgraded","version":2}))
+        let version = if config.writes.writer_lanes > 1 { 3 } else { 2 };
+        activate_feature_version(&store.root, &generation, Some(&journal.name), Some(version))?;
+        Ok(json!({"status":"upgraded","version":version}))
     }
 }
 fn checkpoint(
@@ -856,7 +949,7 @@ pub(super) fn rebuild_v2(config: &Config, activation: Activation) -> Result<Valu
     sync_dir(&generation)?;
     activate_version(root, &generation, Some(&journal.name))?;
     Ok(
-        json!({"status":"rebuilt","version":2,"objects":count,"generation":generation.file_name().unwrap().to_string_lossy()}),
+        json!({"status":"rebuilt","version":activation.version,"objects":count,"generation":generation.file_name().unwrap().to_string_lossy()}),
     )
 }
 
@@ -1012,7 +1105,15 @@ fn visit_locations(
 }
 impl Store {
     pub(crate) fn write_faulted(&self) -> bool {
-        self.writer.lock().faulted
+        self.publication_fault.load(Ordering::Acquire) || self.writer.lock().faulted
+    }
+    /// Nonblocking publication-fence health for a previously certified probe.
+    pub(crate) fn publication_faulted(&self) -> bool {
+        self.publication_fault.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_publication_fault_for_test(&self, faulted: bool) {
+        self.publication_fault.store(faulted, Ordering::Release);
     }
     /// One pass is limited by max_copy_mib even when explicitly forced. Sealed
     /// source files stay immutable while ordinary writers and readers proceed.
@@ -1506,6 +1607,7 @@ impl Store {
         failpoint("vacuum_after_activation")?;
         // Keep process ownership while releasing Fjall, writer and reader file
         // handles. This also permits the cleanup sequence on Windows.
+        let format_version = store.format_version();
         let _lock = store.close_keep_lock();
         for path in old_files {
             if path.exists() {
@@ -1537,7 +1639,7 @@ impl Store {
         sync_dir(&root.join("index"))?;
         sync_dir(&root)?;
         Ok(
-            json!({"status":"vacuumed","objects":objects_count,"live_payload_bytes":payload_bytes,"physical_bytes_before":old_physical,"physical_bytes_after":new_physical,"reclaimed_bytes":old_physical.saturating_sub(new_physical),"version":2}),
+            json!({"status":"vacuumed","objects":objects_count,"live_payload_bytes":payload_bytes,"physical_bytes_before":old_physical,"physical_bytes_after":new_physical,"reclaimed_bytes":old_physical.saturating_sub(new_physical),"version":format_version}),
         )
     }
     fn close_keep_lock(self) -> File {
@@ -1548,6 +1650,15 @@ impl Store {
             root,
             config,
             writer,
+            publication_fault,
+            append_lanes,
+            lane_timings,
+            lane_barrier,
+            commit_queue,
+            commit_changed,
+            multi_writer,
+            #[cfg(test)]
+            lane_pause,
             visibility,
             files,
             files_available,
@@ -1558,8 +1669,12 @@ impl Store {
             retired,
             maintenance,
             verification_control,
+            write_timings,
+            stream_checksums,
             _lock,
         } = self;
+        #[cfg(test)]
+        drop(lane_pause);
         drop((
             objects,
             segments,
@@ -1567,6 +1682,13 @@ impl Store {
             retired,
             db,
             writer,
+            publication_fault,
+            append_lanes,
+            lane_timings,
+            lane_barrier,
+            commit_queue,
+            commit_changed,
+            multi_writer,
             files,
             journal,
             root,
@@ -1577,6 +1699,8 @@ impl Store {
             gc_pressure,
             maintenance,
             verification_control,
+            write_timings,
+            stream_checksums,
         ));
         _lock
     }
@@ -1588,7 +1712,7 @@ fn vacuum_dry_run(config: &Config) -> Result<Value> {
     let _lock = store_lock(root)?;
     let activation = selected_activation(root)?.context("store has no activation")?;
     ensure!(
-        activation.version == 2,
+        activation.version >= 2,
         "v1 stores require explicit upgrade before vacuum"
     );
     let journal = Journal::read_only(
@@ -1779,7 +1903,7 @@ impl ScratchNamespace {
         let Some(activation) = selected_activation(root)? else {
             return Ok(None);
         };
-        if activation.version != 2 {
+        if activation.version < 2 {
             return Ok(None);
         }
         Self::build(config, root, &activation).map(Some)
@@ -1906,6 +2030,15 @@ pub(super) fn verify_v1(
         root: root.clone(),
         config: config.clone(),
         writer: Mutex::new(Writer::default()),
+        publication_fault: AtomicBool::new(false),
+        append_lanes: lanes::new_lanes(),
+        lane_timings: lanes::new_timings(),
+        lane_barrier: RwLock::new(()),
+        commit_queue: Mutex::new(lanes::CommitQueue::default()),
+        commit_changed: Condvar::new(),
+        multi_writer: selected_activation(&config.storage.root)?.is_some_and(|a| a.version >= 3),
+        #[cfg(test)]
+        lane_pause: Mutex::new(None),
         visibility: RwLock::new(()),
         files: Mutex::new(FileCache {
             entries: VecDeque::new(),
@@ -1915,6 +2048,8 @@ pub(super) fn verify_v1(
         object_count: AtomicU64::new(0),
         gc_pressure: AtomicBool::new(false),
         verification_control: crate::verification::Control::default(),
+        write_timings: timings::WriteTimings::default(),
+        stream_checksums: Mutex::new(streaming::ChecksumCache::default()),
         journal: None,
         maintenance: Mutex::new(()),
         _lock: lock,
@@ -2017,6 +2152,15 @@ pub(super) fn verify_v2(
         root: config.storage.root.clone(),
         config: config.clone(),
         writer: Mutex::new(Writer::default()),
+        publication_fault: AtomicBool::new(false),
+        append_lanes: lanes::new_lanes(),
+        lane_timings: lanes::new_timings(),
+        lane_barrier: RwLock::new(()),
+        commit_queue: Mutex::new(lanes::CommitQueue::default()),
+        commit_changed: Condvar::new(),
+        multi_writer: selected_activation(&config.storage.root)?.is_some_and(|a| a.version >= 3),
+        #[cfg(test)]
+        lane_pause: Mutex::new(None),
         visibility: RwLock::new(()),
         files: Mutex::new(FileCache {
             entries: VecDeque::new(),
@@ -2025,6 +2169,8 @@ pub(super) fn verify_v2(
         files_available: Condvar::new(),
         object_count: AtomicU64::new(0),
         verification_control: crate::verification::Control::default(),
+        write_timings: timings::WriteTimings::default(),
+        stream_checksums: Mutex::new(streaming::ChecksumCache::default()),
         gc_pressure: AtomicBool::new(false),
         journal: None,
         maintenance: Mutex::new(()),
@@ -2055,7 +2201,7 @@ pub(super) fn verify_v2(
     drop(store);
     drop(scratch);
     Ok(
-        json!({"status":"verified","version":2,"storage":status,"unreferenced_segments":orphaned,"retired_segments_pending_cleanup":pending,"recovery_required":recovery_required}),
+        json!({"status":"verified","version":activation.version,"storage":status,"unreferenced_segments":orphaned,"retired_segments_pending_cleanup":pending,"recovery_required":recovery_required}),
     )
 }
 
@@ -2277,21 +2423,61 @@ mod witness_tests {
             .root
             .join(path.strip_prefix(&other.storage.root).unwrap());
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        fs::copy(path, destination).unwrap();
+        fs::copy(path, &destination).unwrap();
         config.verification.max_bytes_per_second_mib = 1;
+        // Measure the scanner's cancellation path while the parent retains
+        // the Store. Joining an entire offline verify worker also closes its
+        // private Fjall/scratch databases, which is unrelated filesystem work.
+        let retained = Arc::new(Store::open(&config).unwrap());
+        let scan_progress = Arc::new(crate::progress::Progress::new());
+        let worker_store = retained.clone();
+        let worker_progress = scan_progress.clone();
+        let scanner = std::thread::spawn(move || {
+            verify_orphan(&worker_store, &destination, Some(&worker_progress))
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while scan_progress.snapshot().bytes_scanned < SEGMENT_HEADER + RECORD_HEADER {
+            if scanner.is_finished() {
+                panic!(
+                    "orphan scanner ended before payload scan: {:?}",
+                    scanner.join().unwrap()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orphan payload scan never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled_at = Instant::now();
+        scan_progress.cancel();
+        let error = scanner.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        drop(retained);
+
+        // Retain the high-level integration assertion: cancellation must
+        // propagate through verification and finish cleaning its owned state.
         let progress = Arc::new(crate::progress::Progress::new());
         let worker_progress = progress.clone();
         let worker =
             std::thread::spawn(move || Store::verify_with_progress(&config, &worker_progress));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Fixture/index opening can contend with other filesystem-heavy tests.
+        // The scanner latency bound above excludes opening and teardown.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while progress.snapshot().phase != "scanning orphan segments" {
+            if worker.is_finished() {
+                panic!(
+                    "verification ended before orphan scan: {:?}",
+                    worker.join().unwrap()
+                );
+            }
             assert!(Instant::now() < deadline, "orphan scan never started");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let start = Instant::now();
         progress.cancel();
-        assert!(worker.join().unwrap().is_err());
-        assert!(start.elapsed() < Duration::from_secs(1));
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("cancelled"), "{error:#}");
     }
 
     #[test]

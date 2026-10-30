@@ -2,9 +2,11 @@
 
 SkerryKV is a native Rust service for immutable binary objects. A BLAKE3 hash identifies each object; Fjall stores compact locations, while payloads live in append-only UUIDv4 segment files. It suits write-once/read-many archives and small binary datasets. No external database or Docker installation is required for native use.
 
-The MVP uses one storage volume, one coordinated batching writer, concurrent verified positional reads, SSD/HDD scheduling, and a bounded second-hit SLRU payload cache. Every successful PUT is synchronized. See [architecture](ARCHITECTURE.md), [disk format](docs/FORMAT.md), [batch protocol](docs/PROTOCOL.md), and [implementation evidence](docs/ACCEPTANCE.md).
+The MVP uses one storage volume, bounded hash-shard write scheduling with optional parallel append lanes, serialized durable publication, concurrent verified positional reads, SSD/HDD scheduling, and a bounded second-hit SLRU payload cache. Every successful PUT is synchronized. See [architecture](ARCHITECTURE.md), [disk format](docs/FORMAT.md), [batch protocol](docs/PROTOCOL.md), and [implementation evidence](docs/ACCEPTANCE.md).
 
-See the [performance improvements and rerun](benchmarks/IMPROVEMENTS.md) and original [Pelagia KVStore2 comparison](benchmarks/COMPARISON.md) for measured read/write tradeoffs, review findings, and a reproducible benchmark harness.
+See the [0.3.0 worker, cache, and streaming benchmark results](docs/PERFORMANCE_UPGRADE_RESULTS.md), the [performance improvements and rerun](benchmarks/IMPROVEMENTS.md) and original [Pelagia KVStore2 comparison](benchmarks/COMPARISON.md) for measured read/write tradeoffs, review findings, and a reproducible benchmark harness.
+
+See the [cumulative performance comparison](docs/MULTI_WRITER_REVIEW.md), [filterable benchmark results](docs/MULTI_WRITER_RESULTS.html), and [append-lane configuration](docs/MULTI_WRITER.md) for measurements through 64 clients, writer scheduling, and its store-version boundary.
 
 Download native binaries from [GitHub Releases](https://github.com/Icy-Seas-Co-Laboratory/skerrykv/releases/latest). See [installation and release instructions](docs/RELEASES.md).
 
@@ -90,6 +92,7 @@ When configured, add `-H "Authorization: Bearer $SKERRY_TOKEN"`. All endpoints e
 | GET | `/v1/cache/stats` | Cache counters |
 | POST | `/v1/admin/cache-clear` | Evict resident payload cache |
 | POST | `/v1/admin/gc` | Run a collection pass; service administrator credential required |
+| POST | `/v1/admin/checkpoint` | Checkpoint the v2 journal; service administrator credential required |
 | POST | `/v1/admin/shutdown` | Begin graceful shutdown |
 
 GET supports `?priority=interactive`, `normal`, or `bulk`. Batch GET defaults to input order; `?ordered=false` permits completion order. The [binary protocol specification](docs/PROTOCOL.md) includes layouts and failure semantics. Batch PUT allows partial success; previously committed items survive a malformed suffix. Clients must consume responses while streaming large requests to avoid transport backpressure deadlocks.
@@ -105,25 +108,28 @@ skerry cache stats
 skerry cache clear
 ```
 
-The payload cache uses a bounded second-hit admission tracker and probation/protected SLRU segments. Immutable payloads need no TTL. Admission history expires after five minutes by default, with maintenance every 30 seconds. Large objects exceeding one-quarter of the cache budget bypass admission. Evicted buffers still held by responses remain charged until their last reference drops. Cache clear evicts resident entries; it cannot reclaim active response references immediately. There is no speculative warming or automatic memory-pressure resizing in this version.
+The payload cache uses bounded second-hit history and probation/protected SLRU segments. Its payload, Fjall block-cache, and estimated metadata budgets are independent. The default per-object cache cap is 8 MiB; the 64 MiB metadata budget can impose a lower effective resident-entry count than `max_entries`. Shards each receive fixed budget shares, so hash skew can leave capacity unused. Evicted buffers still held by responses remain charged until their last reference drops. Cache clear cannot reclaim active response references immediately. See [performance and memory controls](docs/PERFORMANCE_UPGRADE.md) before increasing cache budgets.
 
 ## Configuration
 
-`init --path <directory>` creates a store and its `config.toml`. Relative `storage.root` paths resolve against the configuration file directory. Environment overrides are `SKERRY_LISTEN`, `SKERRY_ROOT`, and `SKERRY_TOKEN`. Explicit command destination/configuration options select the store or endpoint; unknown TOML keys fail validation. `config.example.toml` supplies a starting configuration.
+`init --path <directory>` creates a store and its `config.toml`. Relative `storage.root` paths resolve against the configuration file directory. Environment overrides are `SKERRY_LISTEN`, `SKERRY_ROOT`, and `SKERRY_TOKEN`. Explicit command destination/configuration options select the store or endpoint; unknown TOML keys fail validation. `config.example.toml` supplies a starting configuration. The [0.3.0 performance upgrade note](docs/PERFORMANCE_UPGRADE.md) explains streaming, cache, memory-budget, disk-reserve, and checkpoint settings.
 
 All fields have defaults:
 
 | Setting | Default | Meaning |
 |---|---:|---|
 | `server.listen` | `127.0.0.1:7788` | Numeric IP and port |
+| `server.admin_listen` | unset | Optional monitoring/shutdown listener with separate request capacity |
 | `server.request_timeout_seconds` | 120 | Handler deadline |
 | `server.shutdown_timeout_seconds` | 30 | HTTP drain interval before final writer persistence |
 | `storage.root` | `./data` | Entire relocatable store |
+| `storage.min_free_mib` | 256 | Global minimum free-space reserve before writes |
 | `segments.max_size_bytes` | 8589934592 | Segment limit including header/footer |
 | `segments.growth_factor` | 1 | 1 disables growth; 2 enables logical geometric file growth |
 | `writes.batch_max_records` | 512 | Maximum coordinated write group |
 | `writes.batch_max_delay_ms` | 1 | Maximum accumulation window; existing configs retain their value |
 | `writes.max_pending_mib` | 256 | Writer payload budget; HTTP ingress has a separate budget of the same size |
+| `writes.batch_max_bytes_mib` | 16 | Write aggregation target, not request admission capacity |
 | `reads.policy` | `ssd` | `ssd` or `hdd` |
 | `reads.max_concurrency` | 32 | Concurrent read operations |
 | `reads.hdd_window_ms` | 4 | HDD accumulation window |
@@ -133,13 +139,20 @@ All fields have defaults:
 | `resources.max_open_segments` | 256 | Cached segment reader handles; writer/index handles are additional |
 | `resources.max_requests` | 128 | HTTP admissions and coordinator request permits |
 | `resources.max_batch_items` | 4096 | Frames per batch request |
+| `resources.max_inflight_per_batch` | 32 | Concurrent batch items |
+| `resources.admission_timeout_ms` | 5000 | Maximum wait for request capacity |
+| `resources.admin_max_requests` | 8 | Separate admin/monitoring request capacity |
 | `cache.payload_mib` | 256 | Payload allocation budget; 0 disables |
 | `cache.index_mib` | 128 | Fjall block-cache budget |
+| `cache.max_entries` | 1000000 | Independent resident payload entry cap |
+| `cache.max_object_mib` | 8 | Larger individual objects bypass the payload cache |
+| `cache.metadata_mib` | 64 | Estimated cache index/history metadata bound |
+| `cache.shards` | 16 | Power-of-two shard count; per-shard budgets can fragment capacity |
 | `cache.admission_entries` | 65536 | Bounded second-hit tracking entries |
 | `cache.admission_window_seconds` | 300 | Second-hit eligibility window |
 | `logging.level` | `info` | Tracing filter fallback; `RUST_LOG` overrides |
 
-Objects must fit a segment with framing overhead. Resource limits must fit at least one maximum object. Limits represent independently configured budgets, not a whole-process memory bound: Fjall memtables, network/TLS buffers, cache metadata, and allocator overhead are additional. A full read buffer budget produces a retryable resource error rather than waiting indefinitely behind slow responses. Accepted TCP connections are capped at twice `resources.max_requests`, including idle sockets. HTTP input has a 30-second idle timeout. There is no public buffered acknowledgment mode.
+Buffered objects must fit a segment with framing overhead; large streaming objects have their own limit and use temporary files. Resource limits must fit the configured buffered object and stream chunk. The reported configured application budget is not a whole-process RSS bound: database memtables, runtime and network/TLS buffers, allocator overhead, and checkpoint scratch state also use memory. A full read buffer budget produces a retryable resource error rather than waiting indefinitely behind slow responses. Accepted TCP connections are capped at twice `resources.max_requests`, including idle sockets. See [performance and memory controls](docs/PERFORMANCE_UPGRADE.md) for streaming deadlines and disk-reserve behavior.
 
 ## Verification, recovery, and imports
 
@@ -227,3 +240,5 @@ A successful PUT follows segment synchronization, atomic index publication, and 
 The initial version has one volume, no deletion, no replication, no S3/RocksDB adapters, no automatic cache resizing, and no physical-device telemetry. HDD scheduling sorts a bounded window by priority, segment, and offset with aging; it does not merge physical reads through gaps. Ordered batch reads are sequential to guarantee progress without an unbounded reorder buffer. See [acceptance evidence and remaining limits](docs/ACCEPTANCE.md) for platform verification and test scope.
 
 Startup lifecycle, readiness, index-generation listing, and verification progress are documented in [verification and status](docs/VERIFICATION.md). Use `/v1/ready` for traffic readiness; `/v1/health` reports API liveness.
+
+The [HTTP capacity benchmark suite](docs/HTTP_CAPACITY_BENCHMARKS.md) exercises 4, 8, 16, and 32 client workers across write, batch, mixed, and read patterns, with status/metrics probes and explicit regression budgets.

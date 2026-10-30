@@ -303,6 +303,8 @@ async fn request_capacity_is_retained_until_body_drops() {
     let mut config = Config::default();
     config.storage.root = dir.path().to_path_buf();
     config.resources.max_requests = 1;
+    config.resources.admin_max_requests = 1;
+    config.resources.admission_timeout_ms = 20;
     let coordinator = Coordinator::open(config).await.unwrap();
     let app = server::router(coordinator.clone(), CancellationToken::new()).unwrap();
     let retained = app
@@ -333,6 +335,8 @@ async fn ingress_capacity_releases_and_oversized_raw_body_rejects() {
     config.storage.root = dir.path().to_path_buf();
     config.resources.max_object_mib = 1;
     config.writes.max_pending_mib = 1;
+    config.streaming.max_object_mib = 1;
+    config.streaming.min_free_mib = 0;
     let coordinator = Coordinator::open(config).await.unwrap();
     let app = server::router(coordinator.clone(), CancellationToken::new()).unwrap();
     let retained = app
@@ -355,7 +359,7 @@ async fn ingress_capacity_releases_and_oversized_raw_body_rejects() {
         )
         .await
         .unwrap();
-    assert_eq!(exhausted.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(exhausted.status(), StatusCode::OK);
     drop(retained);
     let oversized = app
         .clone()
@@ -525,5 +529,81 @@ async fn retained_read_response_reports_retryable_capacity_exhaustion() {
         .unwrap();
     assert_eq!(third.status(), StatusCode::OK);
     drop(third);
+    coordinator.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_lane_status_and_metrics_report_completed_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.storage.root = dir.path().into();
+    config.writes.writer_lanes = 2;
+    config.resources.admission_timeout_ms = 30_000;
+    let coordinator = Coordinator::open(config).await.unwrap();
+    let app = server::router(coordinator.clone(), CancellationToken::new()).unwrap();
+    let mut jobs = tokio::task::JoinSet::new();
+    for lane in 0..2 {
+        let bytes = (0..u64::MAX)
+            .find_map(|nonce| {
+                let bytes = Bytes::from(format!("live queue lane-{lane}-{nonce}"));
+                (usize::from(blake3::hash(&bytes).as_bytes()[0]) % 2 == lane).then_some(bytes)
+            })
+            .unwrap();
+        let store = coordinator.clone();
+        jobs.spawn(async move { store.put(bytes).await.unwrap() });
+    }
+    while let Some(result) = jobs.join_next().await {
+        result.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while coordinator
+            .writer_status()
+            .lanes
+            .iter()
+            .map(|l| l.completed_items)
+            .sum::<u64>()
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(value["writers"]["configured_lanes"], 2);
+    assert_eq!(value["writers"]["virtual_shards"], 256);
+    assert_eq!(value["writers"]["lanes"][0]["queued_items"], 0);
+    assert_eq!(value["writers"]["lanes"][1]["queued_items"], 0);
+    assert_eq!(value["writers"]["lanes"][0]["completed_items"], 1);
+    assert_eq!(value["writers"]["lanes"][1]["completed_items"], 1);
+    let response = app
+        .oneshot(Request::get("/v1/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = String::from_utf8(
+        to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics.contains("skerry_writer_lanes 2"));
+    assert_eq!(
+        metrics
+            .matches("# TYPE skerry_writer_lane_queued_items ")
+            .count(),
+        1
+    );
+    assert!(metrics.contains("skerry_writer_lane_queued_items{lane=\"0\"} 0"));
+    assert!(metrics.contains("skerry_writer_lane_queued_items{lane=\"1\"} 0"));
     coordinator.shutdown().await.unwrap();
 }

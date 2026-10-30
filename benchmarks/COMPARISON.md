@@ -108,6 +108,10 @@ Strengthening the flush calls reverses the single-write ranking within this cont
 
 5. **Skerry default service writes need tuning.** A sparse coordinator batch waits up to its configured window unless filled or interrupted. Native HTTP batch-put currently awaits each item, missing bulk grouping. HTTP admission reserves a maximum-object allowance: 256 MiB / 64 MiB gives four concurrent uploads despite small objects, so the 8-client benchmark includes retry costs. These are source-backed current behaviors, not limitations of Rust or Fjall.
 
+## Multi-writer stress profile
+
+`scripts/benchmark-http-capacity.py --profile writer-stress` adds duplicate and skewed write patterns across the configured client and writer-lane matrix. `duplicate-put` repeatedly sends one preloaded 4 KiB fixture and validates `duplicate=true`, so measured requests do not grow the physical object set. `skew-put` creates distinct 4 KiB payloads by deterministic nonce search until `hash[0] & 7 == 0`; hashes still span 32 virtual shards and route to physical lane zero for 1, 2, 4, or 8 lanes. Hash generation and rejection sampling consume client CPU. Localhost results include that work and same-host scheduling contention, so separate client and server hosts are preferable when attributing server capacity. Both patterns have the same payload size, fixture count, duration, and setup costs across lane variants. The normal `quick` profile is unchanged.
+
 ## Scope and next steps
 
 Read gains here concern warm, small indexes; bulk gains include batching and synchronization amortization. Do not infer disk-cold, HDD, very large index, sustained compaction, crash-recovery speed, Windows, or Linux performance from this Mac. The large-object corner has 128 operations/trial, so p99 tails are especially noisy. Synthetic size distributions are assumptions, not a measured Pelagia traffic distribution.

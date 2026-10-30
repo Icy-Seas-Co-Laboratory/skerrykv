@@ -61,7 +61,7 @@ jobs:
           python-version: '3.12'
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: python -m unittest discover -s tests -p 'test_release_*.py' -v
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
   native:
     needs: metadata
     name: ${{ matrix.target }}

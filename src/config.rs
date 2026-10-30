@@ -16,6 +16,8 @@ pub struct Config {
     pub reads: Reads,
     pub resources: Resources,
     pub cache: Cache,
+    pub streaming: Streaming,
+    pub checkpoint: Checkpoint,
     pub logging: Logging,
     pub mcp: Mcp,
     pub verification: Verification,
@@ -43,6 +45,7 @@ impl Default for Verification {
 #[serde(default, deny_unknown_fields)]
 pub struct Server {
     pub listen: String,
+    pub admin_listen: Option<String>,
     pub shutdown_timeout_seconds: u64,
     pub request_timeout_seconds: u64,
 }
@@ -50,6 +53,7 @@ impl Default for Server {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:7788".into(),
+            admin_listen: None,
             shutdown_timeout_seconds: 30,
             request_timeout_seconds: 120,
         }
@@ -59,11 +63,14 @@ impl Default for Server {
 #[serde(default, deny_unknown_fields)]
 pub struct Storage {
     pub root: PathBuf,
+    /// Minimum free bytes reserve, in MiB, retained before any store upload.
+    pub min_free_mib: u64,
 }
 impl Default for Storage {
     fn default() -> Self {
         Self {
             root: PathBuf::from("./data"),
+            min_free_mib: 256,
         }
     }
 }
@@ -84,16 +91,25 @@ impl Default for Segments {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Writes {
+    /// Independent append lanes; publication remains a shared durable sequence.
+    pub writer_lanes: usize,
+    /// Maximum publication-coalescing wait for multiple lanes. One lane ignores
+    /// this window; sparse or skewed multi-lane traffic may incur this extra wait.
+    pub commit_max_delay_ms: u64,
     pub batch_max_records: usize,
     pub batch_max_delay_ms: u64,
     pub max_pending_mib: usize,
+    pub batch_max_bytes_mib: usize,
 }
 impl Default for Writes {
     fn default() -> Self {
         Self {
+            writer_lanes: 1,
+            commit_max_delay_ms: 10,
             batch_max_records: 512,
             batch_max_delay_ms: 1,
             max_pending_mib: 256,
+            batch_max_bytes_mib: 16,
         }
     }
 }
@@ -123,6 +139,9 @@ pub struct Resources {
     pub max_open_segments: usize,
     pub max_requests: usize,
     pub max_batch_items: usize,
+    pub admission_timeout_ms: u64,
+    pub max_inflight_per_batch: usize,
+    pub admin_max_requests: usize,
 }
 impl Default for Resources {
     fn default() -> Self {
@@ -132,6 +151,9 @@ impl Default for Resources {
             max_open_segments: 256,
             max_requests: 128,
             max_batch_items: 4096,
+            admission_timeout_ms: 5000,
+            max_inflight_per_batch: 32,
+            admin_max_requests: 8,
         }
     }
 }
@@ -142,6 +164,16 @@ pub struct Cache {
     pub index_mib: usize,
     pub admission_entries: usize,
     pub admission_window_seconds: u64,
+    /// Resident payload entry cap, separate from the admission history cap.
+    pub max_entries: usize,
+    pub max_object_mib: usize,
+    /// Conservative index/history metadata cap. With the default 64 MiB this
+    /// limits resident entries to roughly one hundred thousand even though
+    /// max_entries permits up to sixteen million.
+    pub metadata_mib: usize,
+    /// Power of two from 1 to 64. Byte budgets are divided per shard, so a
+    /// skewed hash distribution can leave capacity unused in another shard.
+    pub shards: usize,
 }
 impl Default for Cache {
     fn default() -> Self {
@@ -150,6 +182,63 @@ impl Default for Cache {
             index_mib: 128,
             admission_entries: 65536,
             admission_window_seconds: 300,
+            max_entries: 1_000_000,
+            max_object_mib: 8,
+            metadata_mib: 64,
+            shards: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Streaming {
+    pub enabled: bool,
+    pub threshold_mib: usize,
+    pub max_object_mib: usize,
+    pub chunk_kib: usize,
+    pub max_uploads: usize,
+    pub max_reads: usize,
+    pub checksum_cache_mib: usize,
+    pub transfer_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub min_free_mib: usize,
+}
+impl Default for Streaming {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_mib: 8,
+            max_object_mib: 4096,
+            chunk_kib: 1024,
+            max_uploads: 2,
+            max_reads: 4,
+            checksum_cache_mib: 16,
+            transfer_timeout_seconds: 3600,
+            idle_timeout_seconds: 30,
+            min_free_mib: 256,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Checkpoint {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub min_journal_mib: usize,
+    pub max_catchup_mib: usize,
+    pub max_tail_kib: usize,
+    pub batch_records: usize,
+}
+impl Default for Checkpoint {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            min_journal_mib: 256,
+            max_catchup_mib: 16,
+            max_tail_kib: 256,
+            batch_records: 512,
         }
     }
 }
@@ -439,11 +528,17 @@ impl Config {
             "reads.queue_items must be 1..65536"
         );
         ensure!(
+            matches!(self.writes.writer_lanes, 1 | 2 | 4 | 8),
+            "writes.writer_lanes must be 1, 2, 4, or 8"
+        );
+        ensure!(
             (1..=4096).contains(&self.writes.batch_max_records),
             "batch_max_records must be 1..4096"
         );
         ensure!(
-            self.writes.batch_max_delay_ms <= 1000 && self.reads.hdd_window_ms <= 1000,
+            self.writes.batch_max_delay_ms <= 1000
+                && self.writes.commit_max_delay_ms <= 1000
+                && self.reads.hdd_window_ms <= 1000,
             "scheduling windows must be at most 1000 ms"
         );
         for (name, mib) in [
@@ -480,8 +575,26 @@ impl Config {
             ensure!((1..=65536).contains(&count), "{name} must be 1..65536");
         }
         ensure!(
-            self.cache.payload_mib <= 65536 && self.cache.index_mib <= 65536,
+            self.cache.payload_mib <= 65536
+                && self.cache.index_mib <= 65536
+                && self.cache.metadata_mib <= 65536,
             "cache budget too large"
+        );
+        ensure!(
+            self.storage.min_free_mib <= 65536,
+            "storage.min_free_mib must be <= 65536 MiB"
+        );
+        ensure!(
+            self.cache.max_entries <= 16_000_000,
+            "cache.max_entries must be <= 16000000"
+        );
+        ensure!(
+            self.cache.max_object_mib <= 65536,
+            "cache.max_object_mib too large"
+        );
+        ensure!(
+            self.cache.shards.is_power_of_two() && (1..=64).contains(&self.cache.shards),
+            "cache.shards must be a power of two in 1..=64"
         );
         ensure!(
             self.cache.admission_entries <= 1_000_000,
@@ -490,6 +603,98 @@ impl Config {
         if self.cache.payload_mib > 0 && self.cache.admission_entries == 0 {
             bail!("payload caching requires admission_entries > 0");
         }
+        if let Some(addr) = &self.server.admin_listen {
+            addr.parse::<SocketAddr>()
+                .context("server.admin_listen must be a socket address")?;
+        }
+        ensure!(
+            self.writes.batch_max_bytes_mib > 0 && self.writes.batch_max_bytes_mib <= 2047,
+            "writes.batch_max_bytes_mib must be 1..=2047"
+        );
+        ensure!(
+            (1..=4096).contains(&self.streaming.chunk_kib),
+            "streaming.chunk_kib must be 1..=4096"
+        );
+        ensure!(
+            self.streaming.max_object_mib <= 8192,
+            "streaming.max_object_mib must be <= 8192 MiB"
+        );
+        let chunk_bytes = self
+            .streaming
+            .chunk_kib
+            .checked_mul(1024)
+            .context("streaming.chunk_kib overflows bytes")?;
+        ensure!(
+            chunk_bytes <= self.writes.max_pending_mib.saturating_mul(1024 * 1024),
+            "streaming chunk must fit within the write byte budget"
+        );
+        ensure!(
+            chunk_bytes
+                <= self
+                    .resources
+                    .max_inflight_read_mib
+                    .saturating_mul(1024 * 1024),
+            "streaming chunk must fit within the in-flight read byte budget"
+        );
+        ensure!(
+            !self.streaming.enabled
+                || (self.streaming.max_object_mib > 0
+                    && self.streaming.max_uploads > 0
+                    && self.streaming.max_reads > 0
+                    && self.streaming.max_uploads <= 65536
+                    && self.streaming.max_reads <= 65536),
+            "enabled streaming requires positive object, upload, and read limits"
+        );
+        ensure!(
+            self.streaming.idle_timeout_seconds > 0 && self.streaming.idle_timeout_seconds <= 86400,
+            "streaming.idle_timeout_seconds must be 1..86400"
+        );
+        ensure!(
+            self.streaming.transfer_timeout_seconds > 0
+                && self.streaming.transfer_timeout_seconds <= 86400,
+            "streaming.transfer_timeout_seconds must be 1..86400"
+        );
+        ensure!(
+            self.streaming.checksum_cache_mib <= 65536,
+            "streaming.checksum_cache_mib must be <= 65536 MiB"
+        );
+        let max_bytes = (self.streaming.max_object_mib as u64)
+            .checked_mul(1024 * 1024)
+            .context("streaming maximum object size overflows bytes")?;
+        let max_chunk_count = max_bytes.div_ceil(chunk_bytes as u64).max(1);
+        let one_table_bytes = max_chunk_count
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(512))
+            .context("streaming checksum table size overflows")?;
+        if self.streaming.checksum_cache_mib > 0 {
+            let checksum_budget = (self.streaming.checksum_cache_mib as u64)
+                .checked_mul(1024 * 1024)
+                .context("streaming checksum cache size overflows")?;
+            ensure!(
+                one_table_bytes <= checksum_budget,
+                "streaming.checksum_cache_mib must fit the checksum table for one maximum object"
+            );
+        } else {
+            let inflight_checksum_bytes = one_table_bytes
+                .checked_mul(self.streaming.max_reads as u64)
+                .context("in-flight checksum metadata budget overflows")?;
+            ensure!(
+                inflight_checksum_bytes <= 64 * 1024 * 1024 * 1024,
+                "in-flight checksum metadata budget exceeds 65536 MiB"
+            );
+        }
+        ensure!(
+            self.checkpoint.interval_seconds > 0
+                && self.checkpoint.batch_records > 0
+                && self.checkpoint.min_journal_mib > 0
+                && self.checkpoint.max_catchup_mib > 0
+                && self.checkpoint.max_tail_kib > 0,
+            "checkpoint interval, journal, catch-up, tail and batch limits must be positive"
+        );
+        ensure!(
+            self.checkpoint.max_tail_kib <= self.checkpoint.max_catchup_mib.saturating_mul(1024),
+            "checkpoint.max_tail_kib must not exceed max_catchup_mib"
+        );
         ensure!(
             self.server.shutdown_timeout_seconds > 0 && self.server.request_timeout_seconds > 0,
             "timeouts must be positive"
@@ -542,6 +747,55 @@ mod tests {
         assert!(toml::from_str::<Config>("[reads]\npolciy='ssd'").is_err());
     }
     #[test]
+    fn large_cache_entry_capacity_is_validated() {
+        let mut config = Config::default();
+        config.cache.max_entries = 1_000_001;
+        assert!(config.validate().is_ok());
+        config.cache.max_entries = 16_000_001;
+        assert!(config.validate().is_err());
+        config.cache.max_entries = 1_000_000;
+        config.cache.shards = 3;
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn streaming_chunk_and_checksum_budgets_are_coherent() {
+        let mut config = Config::default();
+        config.cache.payload_mib = 0;
+        assert!(config.validate().is_ok());
+
+        config.resources.max_object_mib = 1;
+        config.resources.max_inflight_read_mib = 1;
+        config.writes.max_pending_mib = 1;
+        config.streaming.chunk_kib = 2048;
+        assert!(
+            config.validate().is_err(),
+            "chunk must fit both byte budgets"
+        );
+
+        config.streaming.chunk_kib = 1;
+        config.streaming.max_object_mib = 4096;
+        config.streaming.checksum_cache_mib = 1;
+        assert!(
+            config.validate().is_err(),
+            "checksum cache must hold one maximum object table"
+        );
+
+        config.streaming.checksum_cache_mib = 0;
+        config.streaming.max_reads = 65536;
+        assert!(
+            config.validate().is_err(),
+            "uncached in-flight table budget must remain bounded"
+        );
+    }
+    #[test]
+    fn checkpoint_tail_must_fit_catchup_budget() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+        config.checkpoint.max_catchup_mib = 1;
+        config.checkpoint.max_tail_kib = 1025;
+        assert!(config.validate().is_err());
+    }
+    #[test]
     fn verification_limits_default_and_validate() {
         let mut config = Config::default();
         assert_eq!(config.verification.max_concurrency, 1);
@@ -552,6 +806,31 @@ mod tests {
         assert!(config.validate().is_err());
         config.verification.max_concurrency = 2;
         config.verification.max_bytes_per_second_mib = u64::MAX;
+        assert!(config.validate().is_err());
+    }
+    #[test]
+    fn writer_lane_counts_are_explicit_and_bounded() {
+        let mut config = Config::default();
+        assert_eq!(config.writes.writer_lanes, 1);
+        for lanes in [1, 2, 4, 8] {
+            config.writes.writer_lanes = lanes;
+            config.validate().unwrap();
+        }
+        for lanes in [0, 3, 16, usize::MAX] {
+            config.writes.writer_lanes = lanes;
+            assert!(config.validate().is_err());
+        }
+    }
+    #[test]
+    fn multi_writer_commit_window_is_bounded() {
+        let mut config = Config::default();
+        assert_eq!(config.writes.commit_max_delay_ms, 10);
+        config.writes.writer_lanes = 4;
+        for delay in [0, 10, 1000] {
+            config.writes.commit_max_delay_ms = delay;
+            config.validate().unwrap();
+        }
+        config.writes.commit_max_delay_ms = 1001;
         assert!(config.validate().is_err());
     }
 }

@@ -1,0 +1,55 @@
+name: HTTP capacity benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per measurement window (4, 8, 16, 32, 64 client workers)
+        default: '10'
+        required: true
+      repeats:
+        description: Repetitions of each access pattern
+        default: '3'
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: '1.94.1'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - run: cargo build --release --locked --bin skerry --example http_capacity_bench
+      - name: Run repeated isolated HTTP load cases
+        env:
+          BENCH_SECONDS: ${{ inputs.seconds }}
+          BENCH_REPEATS: ${{ inputs.repeats }}
+        run: >-
+          python scripts/benchmark-http-capacity.py
+          --binary target/release/skerry
+          --store-parent target/capacity-stores
+          --output target/capacity-report.json
+          --profile quick --workers 4 8 16 32 64 --writer-lanes 1 2 4 8
+          --seconds "$BENCH_SECONDS" --repeats "$BENCH_REPEATS"
+          --max-store-mib 2048
+          --require-no-rejections --max-probe-failure-fraction 0.01
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: http-capacity-${{ github.sha }}
+          path: |
+            target/capacity-report.json
+            target/capacity-report-runs/*.json
+          retention-days: 14
+          if-no-files-found: warn

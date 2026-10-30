@@ -1,14 +1,20 @@
 //! Bounded asynchronous coordination. All storage/index calls execute on blocking workers.
+mod cache;
+mod checkpoints;
+mod writers;
+pub use writers::{WriteLaneStatus, WriterStatus};
+
 use crate::{
     config::Config,
-    engine::{DeleteResult, PutResult, StorageStatus, Store},
+    engine::{DeleteResult, PreparedPut, PutResult, StorageStatus, Store},
 };
 use anyhow::{Result, anyhow, ensure};
 use bytes::Bytes;
+use cache::PayloadCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -62,10 +68,16 @@ pub struct Status {
     pub health: String,
     pub listen: String,
     pub storage: StorageStatus,
+    #[serde(default)]
+    pub storage_io: crate::engine::WriteTimingSnapshot,
     pub io: IoStatus,
+    #[serde(default)]
+    pub writers: WriterStatus,
     pub cache: CacheStatus,
     #[serde(default)]
     pub gc: GcStatus,
+    #[serde(default)]
+    pub checkpoint: CheckpointStatus,
     pub errors: Vec<String>,
     pub policy: String,
     pub read_workers: usize,
@@ -75,6 +87,15 @@ pub struct Status {
     pub write_queue_capacity_bytes: usize,
     pub events: Vec<String>,
     pub mcp: crate::mcp::McpStatus,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckpointStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub completed_runs: u64,
+    pub last_result: Option<serde_json::Value>,
+    pub last_error: Option<String>,
+    pub progress: Option<crate::progress::ProgressSnapshot>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcStatus {
@@ -103,6 +124,12 @@ pub struct IoStatus {
     pub queue_wait_ms: f64,
     pub disk_read_ms: f64,
     pub storage_write_ms: f64,
+    #[serde(default)]
+    pub write_batches: u64,
+    #[serde(default)]
+    pub write_batch_records: u64,
+    #[serde(default)]
+    pub write_batch_bytes: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheStatus {
@@ -114,6 +141,18 @@ pub struct CacheStatus {
     pub misses: u64,
     pub admissions: u64,
     pub evictions: u64,
+    #[serde(default)]
+    pub metadata_bytes: usize,
+    #[serde(default)]
+    pub metadata_budget_bytes: usize,
+    #[serde(default)]
+    pub payload_budget_bytes: usize,
+    #[serde(default)]
+    pub skipped_large: u64,
+    #[serde(default)]
+    pub skipped_metadata: u64,
+    #[serde(default)]
+    pub skipped_payload: u64,
 }
 #[derive(Default)]
 struct Counters {
@@ -134,6 +173,9 @@ struct Counters {
     queue_wait_us: AtomicU64,
     disk_read_us: AtomicU64,
     storage_write_us: AtomicU64,
+    write_batches: AtomicU64,
+    write_batch_records: AtomicU64,
+    write_batch_bytes: AtomicU64,
     faulted: AtomicBool,
 }
 impl Counters {
@@ -188,6 +230,9 @@ impl Counters {
             queue_wait_ms: self.queue_wait_us.load(Ordering::Relaxed) as f64 / 1000.,
             disk_read_ms: self.disk_read_us.load(Ordering::Relaxed) as f64 / 1000.,
             storage_write_ms: self.storage_write_us.load(Ordering::Relaxed) as f64 / 1000.,
+            write_batches: self.write_batches.load(Ordering::Relaxed),
+            write_batch_records: self.write_batch_records.load(Ordering::Relaxed),
+            write_batch_bytes: self.write_batch_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -202,205 +247,26 @@ impl AsRef<[u8]> for BudgetBuffer {
         &self.data
     }
 }
-struct Entry {
-    bytes: Bytes,
-    tick: u64,
-    protected: bool,
-}
-struct PayloadCache {
-    entries: HashMap<Hash, Entry>,
-    probation: BTreeMap<u64, Hash>,
-    protected: BTreeMap<u64, Hash>,
-    seen: HashMap<Hash, (Instant, u64)>,
-    seen_order: BTreeMap<u64, Hash>,
-    tick: u64,
-    bytes: usize,
-    protected_bytes: usize,
-    limit: usize,
-    admission_limit: usize,
-    window: Duration,
-    budget: Arc<Semaphore>,
-    stats: CacheStatus,
-}
-impl PayloadCache {
-    fn new(c: &Config) -> Self {
-        Self {
-            entries: HashMap::new(),
-            probation: BTreeMap::new(),
-            protected: BTreeMap::new(),
-            seen: HashMap::new(),
-            seen_order: BTreeMap::new(),
-            tick: 0,
-            bytes: 0,
-            protected_bytes: 0,
-            limit: c.cache.payload_mib * 1024 * 1024,
-            admission_limit: c.cache.admission_entries,
-            window: Duration::from_secs(c.cache.admission_window_seconds),
-            budget: Arc::new(Semaphore::new(c.cache.payload_mib * 1024 * 1024)),
-            stats: CacheStatus::default(),
-        }
-    }
-    fn get(&mut self, hash: &Hash) -> Option<Bytes> {
-        self.tick += 1;
-        if let Some(e) = self.entries.get_mut(hash) {
-            if e.protected {
-                self.protected.remove(&e.tick);
-            } else {
-                self.probation.remove(&e.tick);
-                self.protected_bytes += e.bytes.len();
-            }
-            e.tick = self.tick;
-            e.protected = true;
-            self.protected.insert(e.tick, *hash);
-            let result = e.bytes.clone();
-            self.stats.hits += 1;
-            self.stats.served_bytes += result.len() as u64;
-            self.balance();
-            Some(result)
-        } else {
-            self.stats.misses += 1;
-            None
-        }
-    }
-    fn balance(&mut self) {
-        while self.protected_bytes > self.limit * 4 / 5 {
-            let Some((tick, hash)) = self.protected.pop_first() else {
-                break;
-            };
-            if let Some(e) = self.entries.get_mut(&hash) {
-                e.protected = false;
-                self.protected_bytes -= e.bytes.len();
-                self.probation.insert(tick, hash);
-            }
-        }
-    }
-    fn evict(&mut self) -> bool {
-        let victim = self
-            .probation
-            .pop_first()
-            .or_else(|| self.protected.pop_first());
-        if let Some((_, hash)) = victim {
-            if let Some(e) = self.entries.remove(&hash) {
-                self.bytes -= e.bytes.len();
-                if e.protected {
-                    self.protected_bytes -= e.bytes.len();
-                }
-                self.stats.evictions += 1;
-            }
-            true
-        } else {
-            false
-        }
-    }
-    fn observe(&mut self, hash: Hash, data: &Bytes) {
-        if self.limit == 0 || data.len() > self.limit / 4 || self.entries.contains_key(&hash) {
-            return;
-        }
-        self.tick += 1;
-        let second = self
-            .seen
-            .remove(&hash)
-            .map(|(when, tick)| {
-                self.seen_order.remove(&tick);
-                when.elapsed() <= self.window
-            })
-            .unwrap_or(false);
-        if !second {
-            self.seen.insert(hash, (Instant::now(), self.tick));
-            self.seen_order.insert(self.tick, hash);
-            while self.seen.len() > self.admission_limit {
-                if let Some((_, h)) = self.seen_order.pop_first() {
-                    self.seen.remove(&h);
-                }
-            }
-            return;
-        }
-        while self.bytes + data.len() > self.limit || self.entries.len() >= self.admission_limit {
-            if !self.evict() {
-                return;
-            }
-        }
-        let permit = loop {
-            match self
-                .budget
-                .clone()
-                .try_acquire_many_owned(data.len().max(1) as u32)
-            {
-                Ok(p) => break p,
-                Err(_) => {
-                    if !self.evict() {
-                        return;
-                    }
-                }
-            }
-        };
-        let bytes = Bytes::from_owner(BudgetBuffer {
-            data: data.to_vec(),
-            _permit: permit,
-        });
-        self.bytes += bytes.len();
-        self.probation.insert(self.tick, hash);
-        self.entries.insert(
-            hash,
-            Entry {
-                bytes,
-                tick: self.tick,
-                protected: false,
-            },
-        );
-        self.stats.admissions += 1;
-    }
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.probation.clear();
-        self.protected.clear();
-        self.seen.clear();
-        self.seen_order.clear();
-        self.bytes = 0;
-        self.protected_bytes = 0;
-    }
-    fn invalidate(&mut self, hash: &Hash) {
-        if let Some(entry) = self.entries.remove(hash) {
-            self.bytes -= entry.bytes.len();
-            if entry.protected {
-                self.protected_bytes -= entry.bytes.len();
-                self.protected.remove(&entry.tick);
-            } else {
-                self.probation.remove(&entry.tick);
-            }
-        }
-        if let Some((_, tick)) = self.seen.remove(hash) {
-            self.seen_order.remove(&tick);
-        }
-    }
-    fn maintain(&mut self) {
-        while let Some((tick, hash)) = self.seen_order.first_key_value().map(|(k, v)| (*k, *v)) {
-            if self
-                .seen
-                .get(&hash)
-                .is_some_and(|(when, _)| when.elapsed() < self.window)
-            {
-                break;
-            }
-            self.seen_order.remove(&tick);
-            self.seen.remove(&hash);
-        }
-    }
-    fn status(&self) -> CacheStatus {
-        CacheStatus {
-            entries: self.entries.len(),
-            bytes: self.bytes,
-            retained_bytes: self.limit - self.budget.available_permits(),
-            ..self.stats.clone()
-        }
-    }
-}
 
+#[derive(Clone, Debug)]
+enum WriteFailure {
+    StorageFull,
+    Other(String),
+}
+impl From<WriteFailure> for anyhow::Error {
+    fn from(value: WriteFailure) -> Self {
+        match value {
+            WriteFailure::StorageFull => crate::engine::StorageFull.into(),
+            WriteFailure::Other(message) => anyhow::Error::msg(message),
+        }
+    }
+}
 struct WriteRequest {
-    bytes: Bytes,
-    response: oneshot::Sender<std::result::Result<PutResult, String>>,
+    payload: PreparedPut,
+    response: oneshot::Sender<std::result::Result<PutResult, WriteFailure>>,
     _permit: OwnedSemaphorePermit,
-    submitted: Instant,
+    _request: OwnedSemaphorePermit,
+    ticket: writers::WriteTicket,
 }
 enum WriteMessage {
     Put(WriteRequest),
@@ -408,6 +274,16 @@ enum WriteMessage {
         hash: Hash,
         response: oneshot::Sender<std::result::Result<DeleteResult, String>>,
         _request: OwnedSemaphorePermit,
+        ticket: writers::WriteTicket,
+    },
+    Stream {
+        upload: crate::engine::PreparedStreamUpload,
+        length: usize,
+        response: oneshot::Sender<std::result::Result<PutResult, WriteFailure>>,
+        _slot: OwnedSemaphorePermit,
+        _gate: OwnedSemaphorePermit,
+        _request: OwnedSemaphorePermit,
+        ticket: writers::WriteTicket,
     },
     Shutdown(oneshot::Sender<std::result::Result<(), String>>),
 }
@@ -424,26 +300,39 @@ enum ShutdownState {
     Done(std::result::Result<(), String>),
 }
 
+type MonitorHandle = Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
+#[cfg(test)]
+type PutProbeHook = (oneshot::Sender<()>, oneshot::Receiver<()>);
 pub struct Coordinator {
     pub mcp: Arc<crate::mcp::Runtime>,
+    #[cfg(test)]
+    put_probe_hook: Mutex<Option<PutProbeHook>>,
+    #[cfg(test)]
+    stream_prepare_hook: Mutex<Option<PutProbeHook>>,
     read_budget: Arc<Semaphore>,
     pub config: Config,
     store: Arc<Store>,
     write_tx: mpsc::Sender<WriteMessage>,
     read_tx: mpsc::Sender<ReadRequest>,
     write_budget: Arc<Semaphore>,
+    writer_state: Arc<writers::WriterState>,
     requests: Arc<Semaphore>,
+    stream_finalize_gate: Arc<Semaphore>,
+    stream_read_gate: Arc<Semaphore>,
     waiters: Waiters,
-    cache: Arc<Mutex<PayloadCache>>,
+    cache: Arc<PayloadCache>,
     read_epoch: Arc<AtomicU64>,
     gc_status: Arc<Mutex<GcStatus>>,
     gc_gate: Arc<Semaphore>,
     maintenance_stop: tokio_util::sync::CancellationToken,
+    monitor_handles: Mutex<Vec<MonitorHandle>>,
     gc_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    checkpoint_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    checkpoint_state: Arc<Mutex<checkpoints::State>>,
     counters: Arc<Counters>,
     started: Instant,
     accepting: AtomicBool,
-    admission: tokio::sync::Mutex<()>,
+    admission: Arc<tokio::sync::Mutex<()>>,
     shutdown_result: tokio::sync::Mutex<ShutdownState>,
     read_stop: tokio_util::sync::CancellationToken,
     read_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -452,7 +341,10 @@ pub struct Coordinator {
 impl Coordinator {
     /// Constant-time readiness; does not enumerate files or index entries.
     pub fn is_ready(&self) -> bool {
-        self.accepting.load(Ordering::Acquire) && !self.counters.faulted.load(Ordering::Acquire)
+        self.accepting.load(Ordering::Acquire) && !self.write_faulted()
+    }
+    fn write_faulted(&self) -> bool {
+        self.counters.faulted.load(Ordering::Acquire) || self.store.publication_faulted()
     }
     pub async fn open(config: Config) -> Result<Arc<Self>> {
         Self::open_with_progress(config, Arc::new(crate::progress::Progress::new())).await
@@ -471,15 +363,20 @@ impl Coordinator {
         let counters = Arc::new(Counters::default());
         counters.event("store opened; durable write coordinator ready".into());
         let waiters = Arc::new(Mutex::new(HashMap::new()));
-        let cache = Arc::new(Mutex::new(PayloadCache::new(&config)));
+        let cache = Arc::new(PayloadCache::new(&config));
         let read_epoch = Arc::new(AtomicU64::new(0));
-        let write_handle = tokio::spawn(write_loop(
+        let writer_state = Arc::new(writers::WriterState::new(
+            config.writes.writer_lanes,
+            counters.clone(),
+        ));
+        let write_handle = tokio::spawn(writers::write_loop(
             store.clone(),
             write_rx,
             counters.clone(),
             config.clone(),
             cache.clone(),
             read_epoch.clone(),
+            writer_state.clone(),
         ));
         let read_stop = tokio_util::sync::CancellationToken::new();
         let read_budget = Arc::new(Semaphore::new(
@@ -504,7 +401,7 @@ impl Coordinator {
             loop {
                 interval.tick().await;
                 let Some(cache) = weak.upgrade() else { break };
-                cache.lock().maintain();
+                cache.maintain();
             }
         });
         let gc_status = Arc::new(Mutex::new(GcStatus {
@@ -514,12 +411,19 @@ impl Coordinator {
         let maintenance_stop = tokio_util::sync::CancellationToken::new();
         let coordinator = Arc::new(Self {
             mcp: crate::mcp::Runtime::new(&config),
+            #[cfg(test)]
+            put_probe_hook: Mutex::new(None),
+            #[cfg(test)]
+            stream_prepare_hook: Mutex::new(None),
             read_budget,
             write_budget: Arc::new(Semaphore::new(config.writes.max_pending_mib * 1024 * 1024)),
             requests: Arc::new(Semaphore::new(config.resources.max_requests)),
+            stream_finalize_gate: Arc::new(Semaphore::new(config.streaming.max_uploads)),
+            stream_read_gate: Arc::new(Semaphore::new(config.streaming.max_reads)),
             config,
             store,
             write_tx,
+            writer_state,
             read_tx,
             waiters,
             cache,
@@ -527,11 +431,14 @@ impl Coordinator {
             gc_status,
             gc_gate: Arc::new(Semaphore::new(1)),
             maintenance_stop: maintenance_stop.clone(),
+            monitor_handles: Mutex::new(Vec::new()),
             gc_handle: tokio::sync::Mutex::new(None),
+            checkpoint_handle: tokio::sync::Mutex::new(None),
+            checkpoint_state: Arc::new(Mutex::new(checkpoints::State::default())),
             counters,
             started: Instant::now(),
             accepting: AtomicBool::new(true),
-            admission: tokio::sync::Mutex::new(()),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_result: tokio::sync::Mutex::new(ShutdownState::Running),
             read_stop,
             read_handle: tokio::sync::Mutex::new(Some(read_handle)),
@@ -560,7 +467,31 @@ impl Coordinator {
             });
             *coordinator.gc_handle.lock().await = Some(handle);
         }
+        *coordinator.checkpoint_handle.lock().await = checkpoints::spawn(&coordinator);
         Ok(coordinator)
+    }
+    pub(crate) fn has_cached_payload(&self, hash: &[u8; 32]) -> bool {
+        self.cache.contains(hash)
+    }
+    pub(crate) fn monitor_stop(&self) -> tokio_util::sync::CancellationToken {
+        self.maintenance_stop.clone()
+    }
+    pub(crate) fn register_monitor(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let mut handles = self.monitor_handles.lock();
+        if self.maintenance_stop.is_cancelled() {
+            return;
+        }
+        // Reap completed producers as new work arrives; retaining every joined
+        // stream until shutdown would make the tracking list grow without bound.
+        handles.retain(|handle| {
+            handle.try_lock().map_or(true, |guard| {
+                guard.as_ref().is_some_and(|task| !task.is_finished())
+            })
+        });
+        handles.push(Arc::new(tokio::sync::Mutex::new(Some(tokio::spawn(task)))));
     }
     pub(crate) fn storage(&self) -> Arc<Store> {
         self.store.clone()
@@ -576,6 +507,49 @@ impl Coordinator {
             .clone()
             .try_acquire_many_owned(bytes as u32)
             .map_err(|_| ResourceExhausted.into())
+    }
+    pub(crate) async fn stream_read_gate(&self) -> Result<OwnedSemaphorePermit> {
+        let permit = tokio::time::timeout(
+            Duration::from_millis(self.config.resources.admission_timeout_ms),
+            self.stream_read_gate.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ResourceExhausted)??;
+        {
+            let _guard = self.admission.lock().await;
+            ensure!(self.is_ready(), "service is not accepting reads");
+        }
+        Ok(permit)
+    }
+    pub(crate) async fn stream_request_permit(&self) -> Result<OwnedSemaphorePermit> {
+        Ok(tokio::time::timeout(
+            Duration::from_millis(self.config.resources.admission_timeout_ms),
+            self.requests.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ResourceExhausted)??)
+    }
+    pub(crate) fn stream_read_started(&self) {
+        self.counters.reads.fetch_add(1, Ordering::Relaxed);
+        self.counters.inflight_reads.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn stream_read_finished(&self) {
+        self.counters.inflight_reads.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub(crate) fn stream_read_bytes(&self, bytes: usize) {
+        self.counters
+            .read_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    pub(crate) async fn read_memory_permit(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
+        Ok(tokio::time::timeout(
+            Duration::from_millis(self.config.resources.admission_timeout_ms),
+            self.read_budget
+                .clone()
+                .acquire_many_owned(bytes.max(1) as u32),
+        )
+        .await
+        .map_err(|_| ResourceExhausted)??)
     }
     async fn blocking_metadata<T: Send + 'static>(
         &self,
@@ -608,46 +582,114 @@ impl Coordinator {
         self.blocking_metadata(move |store| store.object_info(hash))
             .await
     }
+    pub(crate) async fn finish_stream_upload(
+        &self,
+        upload: crate::engine::StreamUpload,
+        slot: OwnedSemaphorePermit,
+        length: usize,
+    ) -> Result<PutResult> {
+        let started = Instant::now();
+        let gate = self.stream_finalize_gate.clone().acquire_owned().await?;
+        let request = tokio::time::timeout(
+            Duration::from_millis(self.config.resources.admission_timeout_ms),
+            self.requests.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ResourceExhausted)??;
+        {
+            let _guard = self.admission.lock().await;
+            ensure!(self.is_ready(), "service is not accepting writes");
+        }
+        // Bulk checksum/footer/sync work must not occupy an append lane or the
+        // global admission lock. Its blocking worker owns every transfer permit.
+        let (upload, gate, slot, request) = tokio::task::spawn_blocking(move || {
+            let prepared = upload.prepare_finish();
+            prepared.map(|upload| (upload, gate, slot, request))
+        })
+        .await??;
+        ensure!(
+            upload.len() == length as u64,
+            "stream completion length mismatch"
+        );
+        #[cfg(test)]
+        {
+            let hook = self.stream_prepare_hook.lock().take();
+            if let Some((ready, release)) = hook {
+                let _ = ready.send(());
+                let _ = release.await;
+            }
+        }
+        let response = {
+            let _guard = self.admission.lock().await;
+            ensure!(self.is_ready(), "service is not accepting writes");
+            let channel = self
+                .write_tx
+                .reserve()
+                .await
+                .map_err(|_| anyhow!("writer stopped"))?;
+            let (response, wait) = oneshot::channel();
+            // A prepared file consumes no queued payload RAM, but retains a
+            // global request slot and its transfer/finalization permits.
+            let ticket = self.writer_state.ticket(upload.hash(), 0, started);
+            channel.send(WriteMessage::Stream {
+                upload,
+                length,
+                response,
+                _slot: slot,
+                _gate: gate,
+                _request: request,
+                ticket,
+            });
+            wait
+        };
+        response
+            .await
+            .map_err(|_| anyhow!("writer stopped before stream completion"))?
+            .map_err(anyhow::Error::from)
+    }
     pub async fn put(&self, bytes: Bytes) -> Result<PutResult> {
         let start = Instant::now();
         ensure!(
             bytes.len() <= self.config.max_object_bytes(),
             "object too large"
         );
-        let request = self.requests.clone().acquire_owned().await?;
-        let permit = self
-            .write_budget
-            .clone()
-            .acquire_many_owned(bytes.len().max(1) as u32)
-            .await?;
+        let request = tokio::time::timeout(
+            Duration::from_millis(self.config.resources.admission_timeout_ms),
+            self.requests.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ResourceExhausted)??;
+        let permit = tokio::time::timeout(
+            Duration::from_millis(self.config.resources.admission_timeout_ms),
+            self.write_budget
+                .clone()
+                .acquire_many_owned(bytes.len().max(1) as u32),
+        )
+        .await
+        .map_err(|_| ResourceExhausted)??;
         let store = self.store.clone();
-        let (duplicate, bytes, _request, permit) = tokio::task::spawn_blocking(move || {
-            // Hashing cannot be aborted: retain both byte and request capacity
-            // until this worker exits even if its caller disconnects.
-            let result = store.committed_duplicate(&bytes);
-            (result, bytes, request, permit)
+        let probe_epoch = self.read_epoch.load(Ordering::Acquire);
+        let (payload, duplicate, request, permit) = tokio::task::spawn_blocking(move || {
+            // A cancelled caller cannot release the bytes/request while hashing.
+            let payload = store.prepare_put(bytes);
+            // The healthy publication gate certifies this mapping. Admission
+            // below still checks shard work and the deletion epoch before ack.
+            let duplicate = payload.as_ref().map_or_else(
+                |_| Ok(None),
+                |payload| store.committed_prepared_duplicate(payload),
+            );
+            (payload, duplicate, request, permit)
         })
         .await?;
-        if let Some(result) = duplicate? {
-            let _guard = self.admission.lock().await;
-            ensure!(
-                self.accepting.load(Ordering::Acquire),
-                "service shutting down"
-            );
-            ensure!(
-                !self.counters.faulted.load(Ordering::Acquire),
-                "writer faulted; restart and recover before writing"
-            );
-            self.counters.writes.fetch_add(1, Ordering::Relaxed);
-            self.counters
-                .write_bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            self.counters.deduplicated.fetch_add(1, Ordering::Relaxed);
-            self.counters
-                .deduplicated_bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            self.counters.latency(start);
-            return Ok(result);
+        let payload = payload?;
+        let duplicate = duplicate?;
+        #[cfg(test)]
+        {
+            let hook = self.put_probe_hook.lock().take();
+            if let Some((ready, release)) = hook {
+                let _ = ready.send(());
+                let _ = release.await;
+            }
         }
         let response = {
             let _guard = self.admission.lock().await;
@@ -659,25 +701,47 @@ impl Coordinator {
                 !self.counters.faulted.load(Ordering::Acquire),
                 "writer faulted; restart and recover before writing"
             );
+            if let Some(result) = duplicate
+                && self.writer_state.pending_deletes(&payload.hash()) == 0
+                && self.read_epoch.load(Ordering::Acquire) == probe_epoch
+            {
+                ensure!(
+                    !self.store.publication_faulted(),
+                    "writer faulted; restart and recover before writing"
+                );
+                self.counters.writes.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .write_bytes
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                self.counters.deduplicated.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .deduplicated_bytes
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                self.counters.latency(start);
+                return Ok(result);
+            }
             let (tx, rx) = oneshot::channel();
             let slot = self
                 .write_tx
                 .reserve()
                 .await
                 .map_err(|_| anyhow!("writer stopped"))?;
-            self.counters.write_queue.fetch_add(1, Ordering::Relaxed);
+            let ticket = self
+                .writer_state
+                .ticket(payload.hash(), payload.len(), start);
             slot.send(WriteMessage::Put(WriteRequest {
-                bytes,
+                payload,
                 response: tx,
                 _permit: permit,
-                submitted: start,
+                _request: request,
+                ticket,
             }));
             rx
         };
         let result = response
             .await
             .map_err(|_| anyhow!("writer stopped before completion"))?
-            .map_err(anyhow::Error::msg);
+            .map_err(anyhow::Error::from);
         self.counters.latency(start);
         result
     }
@@ -700,11 +764,12 @@ impl Coordinator {
                 .await
                 .map_err(|_| anyhow!("writer stopped"))?;
             let (tx, rx) = oneshot::channel();
-            self.counters.write_queue.fetch_add(1, Ordering::Relaxed);
+            let ticket = self.writer_state.delete_ticket(hash, started);
             slot.send(WriteMessage::Delete {
                 hash,
                 response: tx,
                 _request: request,
+                ticket,
             });
             rx
         };
@@ -786,8 +851,10 @@ impl Coordinator {
         );
         self.counters.reads.fetch_add(1, Ordering::Relaxed);
         let (cached, epoch) = {
-            let mut cache = self.cache.lock();
-            (cache.get(&hash), self.read_epoch.load(Ordering::Acquire))
+            (
+                self.cache.get(&hash),
+                self.read_epoch.load(Ordering::Acquire),
+            )
         };
         if let Some(bytes) = cached {
             self.counters
@@ -846,11 +913,22 @@ impl Coordinator {
     }
     pub async fn status(&self) -> Result<Status> {
         let storage = self.blocking_metadata(|store| store.status()).await?;
-        Ok(Status {
+        Ok(self.status_from_storage(storage))
+    }
+    pub(crate) fn initial_monitoring_status(&self) -> Result<Status> {
+        Ok(self.status_from_storage(self.store.status()?))
+    }
+    pub(crate) async fn monitoring_status(&self) -> Result<Status> {
+        let store = self.store.clone();
+        let storage = tokio::task::spawn_blocking(move || store.status()).await??;
+        Ok(self.status_from_storage(storage))
+    }
+    fn status_from_storage(&self, storage: StorageStatus) -> Status {
+        Status {
             mcp: self.mcp.status(),
             version: env!("CARGO_PKG_VERSION").into(),
             uptime_seconds: self.started.elapsed().as_secs_f64(),
-            health: if self.counters.faulted.load(Ordering::Acquire) {
+            health: if self.write_faulted() {
                 "write-faulted"
             } else if !self.accepting.load(Ordering::Acquire) {
                 "stopping"
@@ -860,9 +938,15 @@ impl Coordinator {
             .into(),
             listen: self.config.server.listen.clone(),
             storage,
+            storage_io: self.store.write_timings(),
             io: self.counters.snapshot(),
-            cache: self.cache.lock().status(),
+            writers: self.writer_status(),
+            cache: self.cache.status(),
             gc: self.gc_status.lock().clone(),
+            checkpoint: self
+                .checkpoint_state
+                .lock()
+                .status(self.config.checkpoint.enabled),
             errors: self.counters.errors.lock().iter().cloned().collect(),
             policy: self.config.reads.policy.clone(),
             read_workers: self.config.reads.max_concurrency,
@@ -876,11 +960,56 @@ impl Coordinator {
                 + 2 * self.config.writes.max_pending_mib
                 + self.config.resources.max_inflight_read_mib
                 + self.config.cache.payload_mib
-                + self.config.cache.index_mib,
-        })
+                + self.config.cache.index_mib
+                + self.config.cache.metadata_mib
+                + if self.config.streaming.checksum_cache_mib > 0 {
+                    self.config.streaming.checksum_cache_mib
+                } else {
+                    let chunk = self.config.streaming.chunk_kib * 1024;
+                    let bytes =
+                        (self.config.streaming.max_object_mib * 1024 * 1024).div_ceil(chunk) * 32
+                            + 512;
+                    bytes
+                        .saturating_mul(self.config.streaming.max_reads)
+                        .div_ceil(1024 * 1024)
+                },
+        }
+    }
+    pub fn writer_status(&self) -> WriterStatus {
+        let mut status = self.writer_state.status();
+        for (lane, timings) in status.lanes.iter_mut().zip(self.store.write_lane_timings()) {
+            lane.append_seconds = timings.append_us as f64 / 1_000_000.;
+            lane.data_sync_seconds = timings.data_sync_us as f64 / 1_000_000.;
+            lane.commit_wait_seconds = timings.commit_wait_us as f64 / 1_000_000.;
+        }
+        status
+    }
+    pub(crate) fn live_cache_status(&self) -> CacheStatus {
+        self.cache.status()
+    }
+    pub(crate) fn refresh_live_status(&self, status: &mut Status) {
+        status.uptime_seconds = self.started.elapsed().as_secs_f64();
+        status.io = self.counters.snapshot();
+        status.writers = self.writer_status();
+        status.storage_io = self.store.write_timings();
+        status.checkpoint = self
+            .checkpoint_state
+            .lock()
+            .status(self.config.checkpoint.enabled);
+        status.cache = self.cache.status();
+        status.health = if self.write_faulted() {
+            "write-faulted"
+        } else if !self.accepting.load(Ordering::Acquire) {
+            "stopping"
+        } else {
+            "running"
+        }
+        .into();
+        status.write_queue_bytes = self.config.writes.max_pending_mib * 1024 * 1024
+            - self.write_budget.available_permits();
     }
     pub fn cache_clear(&self) {
-        self.cache.lock().clear();
+        self.cache.clear();
         self.counters.event("payload cache cleared".into());
     }
     pub async fn shutdown(&self) -> Result<()> {
@@ -888,9 +1017,22 @@ impl Coordinator {
         let result = {
             let mut state = self.shutdown_result.lock().await;
             if matches!(*state, ShutdownState::Running) {
-                let _guard = self.admission.lock().await;
-                self.accepting.store(false, Ordering::Release);
-                self.maintenance_stop.cancel();
+                {
+                    let _guard = self.admission.lock().await;
+                    self.accepting.store(false, Ordering::Release);
+                    self.maintenance_stop.cancel();
+                    checkpoints::cancel(self);
+                }
+                let _streams_drained = self
+                    .stream_finalize_gate
+                    .clone()
+                    .acquire_many_owned(self.config.streaming.max_uploads as u32)
+                    .await?;
+                let _reads_drained = self
+                    .stream_read_gate
+                    .clone()
+                    .acquire_many_owned(self.config.streaming.max_reads as u32)
+                    .await?;
                 // Non-abortable compaction retains this gate until its last
                 // blocking operation finishes, including after caller cancellation.
                 let _gc_drained = self.gc_gate.clone().acquire_owned().await?;
@@ -918,6 +1060,11 @@ impl Coordinator {
         };
         self.mcp.cancel_jobs().await;
         join_worker(&self.gc_handle).await?;
+        join_worker(&self.checkpoint_handle).await?;
+        let monitors = self.monitor_handles.lock().clone();
+        for monitor in monitors {
+            join_worker(&monitor).await?;
+        }
         self.read_stop.cancel();
         join_worker(&self.write_handle).await?;
         join_worker(&self.read_handle).await?;
@@ -925,9 +1072,70 @@ impl Coordinator {
     }
     pub fn metrics(&self) -> String {
         let io = self.counters.snapshot();
-        let cache = self.cache.lock().status();
+        let cache = self.cache.status();
+        let storage_io = self.store.write_timings();
         let mcp = self.mcp.status();
         let mut out = String::new();
+        out.push_str(&format!(
+            "# TYPE skerry_ready gauge\nskerry_ready {}\n# TYPE skerry_writer_faulted gauge\nskerry_writer_faulted {}\n",
+            u8::from(self.is_ready()), u8::from(self.write_faulted()),
+        ));
+        let writers = self.writer_status();
+        out.push_str(&format!(
+            "# TYPE skerry_writer_lanes gauge\nskerry_writer_lanes {}\n",
+            writers.configured_lanes
+        ));
+        for lane in writers.lanes {
+            for (name, value, kind) in [
+                ("queued_items", lane.queued_items as f64, "gauge"),
+                ("queued_bytes", lane.queued_bytes as f64, "gauge"),
+                ("inflight_items", lane.inflight_items as f64, "gauge"),
+                ("inflight_bytes", lane.inflight_bytes as f64, "gauge"),
+                ("active_shards", lane.active_shards as f64, "gauge"),
+                ("oldest_wait_seconds", lane.oldest_wait_seconds, "gauge"),
+                ("batches_total", lane.batches as f64, "counter"),
+                (
+                    "completed_items_total",
+                    lane.completed_items as f64,
+                    "counter",
+                ),
+                (
+                    "queue_wait_seconds_total",
+                    lane.queue_wait_seconds,
+                    "counter",
+                ),
+                ("service_seconds_total", lane.service_seconds, "counter"),
+                ("append_seconds_total", lane.append_seconds, "counter"),
+                ("data_sync_seconds_total", lane.data_sync_seconds, "counter"),
+                (
+                    "commit_wait_seconds_total",
+                    lane.commit_wait_seconds,
+                    "counter",
+                ),
+            ] {
+                if lane.lane == 0 {
+                    out.push_str(&format!("# TYPE skerry_writer_lane_{name} {kind}\n"));
+                }
+                out.push_str(&format!(
+                    "skerry_writer_lane_{name}{{lane=\"{}\"}} {value}\n",
+                    lane.lane
+                ));
+            }
+        }
+        for (name, value) in [
+            ("data_sync_us", storage_io.data_sync_us),
+            ("data_sync_calls", storage_io.data_sync_calls),
+            ("journal_sync_us", storage_io.journal_sync_us),
+            ("journal_sync_calls", storage_io.journal_sync_calls),
+            ("witness_sync_us", storage_io.witness_sync_us),
+            ("witness_sync_calls", storage_io.witness_sync_calls),
+            ("index_apply_us", storage_io.index_apply_us),
+            ("index_persist_us", storage_io.index_persist_us),
+        ] {
+            out.push_str(&format!(
+                "# TYPE skerry_{name}_total counter\nskerry_{name}_total {value}\n"
+            ));
+        }
         for (name, value) in [
             ("mcp_enabled", f64::from(mcp.enabled)),
             ("mcp_read_only", f64::from(mcp.read_only)),
@@ -947,6 +1155,9 @@ impl Coordinator {
             ("mcp_verification_jobs", mcp.verification_jobs as f64),
             ("reads_total", io.reads as f64),
             ("writes_total", io.writes as f64),
+            ("write_batches_total", io.write_batches as f64),
+            ("write_batch_records_total", io.write_batch_records as f64),
+            ("write_batch_bytes_total", io.write_batch_bytes as f64),
             ("read_bytes_total", io.read_bytes as f64),
             ("write_bytes_total", io.write_bytes as f64),
             ("deduplicated_total", io.deduplicated as f64),
@@ -993,168 +1204,16 @@ async fn join_worker(
     Ok(())
 }
 
-async fn write_loop(
-    store: Arc<Store>,
-    mut rx: mpsc::Receiver<WriteMessage>,
-    counters: Arc<Counters>,
-    config: Config,
-    cache: Arc<Mutex<PayloadCache>>,
-    epoch: Arc<AtomicU64>,
-) {
-    let mut pending_shutdown = None;
-    let mut deferred = None;
-    loop {
-        let message = match deferred.take() {
-            Some(message) => message,
-            None => match rx.recv().await {
-                Some(message) => message,
-                None => break,
-            },
-        };
-        let first = match message {
-            WriteMessage::Put(r) => r,
-            WriteMessage::Delete {
-                hash,
-                response,
-                _request,
-            } => {
-                let _request = _request;
-                counters.write_queue.fetch_sub(1, Ordering::Relaxed);
-                let db = store.clone();
-                let result = if counters.faulted.load(Ordering::Acquire) {
-                    Err(anyhow!("writer faulted"))
-                } else {
-                    tokio::task::spawn_blocking(move || {
-                        let result = db.delete(&hash);
-                        let faulted = db.write_faulted();
-                        (result, faulted)
-                    })
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|(result, faulted)| {
-                        if faulted {
-                            counters.faulted.store(true, Ordering::Release);
-                        }
-                        result
-                    })
-                };
-                match result {
-                    Ok(result) => {
-                        // Complete the fence while holding the same cache lock
-                        // used by read completion; an old read cannot repopulate it.
-                        let mut cache = cache.lock();
-                        epoch.fetch_add(1, Ordering::AcqRel);
-                        cache.invalidate(&hash);
-                        drop(cache);
-                        counters.event(format!(
-                            "durable delete {} (existed={})",
-                            hex::encode(hash),
-                            result.deleted
-                        ));
-                        let _ = response.send(Ok(result));
-                    }
-                    Err(error) => {
-                        let error = format!("{error:#}");
-                        counters.error(error.clone());
-                        let _ = response.send(Err(error));
-                    }
-                }
-                continue;
-            }
-            WriteMessage::Shutdown(done) => {
-                pending_shutdown = Some(done);
-                break;
-            }
-        };
-        let mut batch = vec![first];
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(config.writes.batch_max_delay_ms);
-        while batch.len() < config.writes.batch_max_records {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(WriteMessage::Put(r))) => batch.push(r),
-                Ok(Some(WriteMessage::Shutdown(done))) => {
-                    pending_shutdown = Some(done);
-                    break;
-                }
-                Ok(Some(message @ WriteMessage::Delete { .. })) => {
-                    deferred = Some(message);
-                    break;
-                }
-                _ => break,
-            }
-        }
-        counters
-            .write_queue
-            .fetch_sub(batch.len(), Ordering::Relaxed);
-        for r in &batch {
-            counters
-                .queue_wait_us
-                .fetch_add(r.submitted.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        let payloads: Vec<_> = batch.iter().map(|r| r.bytes.clone()).collect();
-        let db = store.clone();
-        let start = Instant::now();
-        let result = if counters.faulted.load(Ordering::Acquire) {
-            Err(anyhow!("writer faulted"))
-        } else {
-            tokio::task::spawn_blocking(move || db.put_many(&payloads))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|x| x)
-        };
-        counters
-            .storage_write_us
-            .fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        match result {
-            Ok(results) => {
-                counters.event(format!(
-                    "durably completed {} write requests",
-                    results.len()
-                ));
-                for (r, result) in batch.into_iter().zip(results) {
-                    counters.writes.fetch_add(1, Ordering::Relaxed);
-                    counters
-                        .write_bytes
-                        .fetch_add(r.bytes.len() as u64, Ordering::Relaxed);
-                    if result.duplicate {
-                        counters.deduplicated.fetch_add(1, Ordering::Relaxed);
-                        counters
-                            .deduplicated_bytes
-                            .fetch_add(r.bytes.len() as u64, Ordering::Relaxed);
-                    }
-                    let _ = r.response.send(Ok(result));
-                }
-            }
-            Err(e) => {
-                let error = format!("{e:#}");
-                counters.faulted.store(true, Ordering::Release);
-                counters.error(error.clone());
-                for r in batch {
-                    let _ = r.response.send(Err(error.clone()));
-                }
-            }
-        }
-        if pending_shutdown.is_some() {
-            break;
-        }
-    }
-    let result = if counters.faulted.load(Ordering::Acquire) {
-        Err(anyhow!(
-            "writer faulted; shutdown cannot certify final persistence"
-        ))
+fn complete_write_error(counters: &Counters, batch: Vec<WriteRequest>, error: anyhow::Error) {
+    let failure = if error.downcast_ref::<crate::engine::StorageFull>().is_some() {
+        WriteFailure::StorageFull
     } else {
-        tokio::task::spawn_blocking(move || {
-            store.seal()?;
-            store.sync()
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|x| x)
+        counters.faulted.store(true, Ordering::Release);
+        WriteFailure::Other(format!("{error:#}"))
     };
-    if let Some(done) = pending_shutdown {
-        let _ = done.send(result.map_err(|e| format!("{e:#}")));
-    } else if let Err(e) = result {
-        counters.error(format!("{e:#}"));
+    counters.error(format!("{error:#}"));
+    for request in batch {
+        let _ = request.response.send(Err(failure.clone()));
     }
 }
 
@@ -1168,7 +1227,7 @@ async fn read_loop(
     store: Arc<Store>,
     mut rx: mpsc::Receiver<ReadRequest>,
     waiters: Waiters,
-    cache: Arc<Mutex<PayloadCache>>,
+    cache: Arc<PayloadCache>,
     counters: Arc<Counters>,
     config: Config,
     control: ReadControl,
@@ -1303,11 +1362,10 @@ async fn read_loop(
                         })
                     })
                 });
-                if let Ok(Some(bytes)) = &result {
-                    let mut cache = cache.lock();
-                    if epoch.load(Ordering::Acquire) == request.epoch {
-                        cache.observe(hash, bytes);
-                    }
+                if let Ok(Some(bytes)) = &result
+                    && epoch.load(Ordering::Acquire) == request.epoch
+                {
+                    cache.observe(hash, bytes);
                 }
                 if let Err(e) = &result {
                     counters.error(e.clone());
@@ -1331,36 +1389,477 @@ fn complete(waiters: &Waiters, key: ReadKey, result: SharedResult) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn bounded_cache_second_hit_and_retained_buffers() {
-        let mut config = Config::default();
-        config.cache.payload_mib = 1;
-        config.cache.admission_entries = 2;
-        let mut cache = PayloadCache::new(&config);
-        let data = Bytes::from(vec![1; 100]);
-        let hash = [1; 32];
-        cache.observe(hash, &data);
-        assert_eq!(cache.status().entries, 0);
-        cache.observe(hash, &data);
-        assert_eq!(cache.status().entries, 1);
-        let held = cache.get(&hash).unwrap();
-        cache.clear();
-        assert_eq!(cache.status().bytes, 0);
-        assert_eq!(cache.status().retained_bytes, 100);
-        drop(held);
-        assert_eq!(cache.status().retained_bytes, 0);
-        for h in 0..100 {
-            cache.observe([h; 32], &data);
-        }
-        assert!(cache.seen.len() <= 2);
-    }
-}
-
-#[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelling_prepared_stream_before_admission_cleans_file_and_permits() {
+        fn segment_files(root: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+            let mut files = std::collections::HashSet::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path.extension().is_some_and(|ext| ext == "seg") {
+                        files.insert(path);
+                    }
+                }
+            }
+            files
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        config.writes.writer_lanes = 4;
+        let store = Coordinator::open(config.clone()).await.unwrap();
+        let old_bytes = Bytes::from_static(b"acknowledged data survives cancelled prepared stream");
+        let old_hash = store.put(old_bytes.clone()).await.unwrap().hash;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.requests.available_permits() != config.resources.max_requests {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let before = segment_files(&root.path().join("segments"));
+        let bytes = b"prepared but never admitted for publication";
+        let mut upload = store
+            .store
+            .begin_upload(1024 * 1024, Some(bytes.len() as u64))
+            .unwrap();
+        upload.write_chunk(bytes).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let slot = slots.clone().acquire_owned().await.unwrap();
+        let (ready, prepared) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        *store.stream_prepare_hook.lock() = Some((ready, wait));
+        let finish = {
+            let store = store.clone();
+            tokio::spawn(async move { store.finish_stream_upload(upload, slot, bytes.len()).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), prepared)
+            .await
+            .unwrap()
+            .unwrap();
+        let after_prepare = segment_files(&root.path().join("segments"));
+        assert_eq!(after_prepare.difference(&before).count(), 1);
+        assert_eq!(
+            store.requests.available_permits(),
+            config.resources.max_requests - 1
+        );
+        assert_eq!(
+            store.stream_finalize_gate.available_permits(),
+            config.streaming.max_uploads - 1
+        );
+        assert_eq!(slots.available_permits(), 0);
+        finish.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), finish)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        let _ = release.send(());
+        assert_eq!(segment_files(&root.path().join("segments")), before);
+        assert_eq!(
+            store.requests.available_permits(),
+            config.resources.max_requests
+        );
+        assert_eq!(
+            store.stream_finalize_gate.available_permits(),
+            config.streaming.max_uploads
+        );
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(store.store.get(&old_hash).unwrap().unwrap(), old_bytes);
+        assert_eq!(store.store.status().unwrap().objects, 1);
+        store.shutdown().await.unwrap();
+        drop(store);
+        let reopened = Store::open(&config).unwrap();
+        assert_eq!(reopened.get(&old_hash).unwrap().unwrap(), old_bytes);
+        assert_eq!(reopened.status().unwrap().objects, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_probe_cannot_acknowledge_across_completed_deletion() {
+        for lanes in [1, 2, 4, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.storage.root = root.path().into();
+            config.writes.writer_lanes = lanes;
+            let store = Coordinator::open(config).await.unwrap();
+            let bytes = Bytes::from_static(b"duplicate probe deletion fence");
+            let hash = store.put(bytes.clone()).await.unwrap().hash;
+            let (ready, paused) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
+            *store.put_probe_hook.lock() = Some((ready, wait));
+            let put = {
+                let store = store.clone();
+                tokio::spawn(async move { store.put(bytes).await })
+            };
+            paused.await.unwrap();
+            assert!(store.delete(hash).await.unwrap().deleted);
+            assert!(store.store.get(&hash).unwrap().is_none());
+            release.send(()).unwrap();
+            let result = put.await.unwrap().unwrap();
+            assert!(!result.duplicate);
+            assert_eq!(
+                store.store.get(&hash).unwrap().unwrap(),
+                b"duplicate probe deletion fence"
+            );
+            store.shutdown().await.unwrap();
+        }
+    }
+    #[test]
+    fn duplicate_probe_bypasses_queued_put_but_waits_for_delete() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for lanes in [1, 2, 4, 8] {
+                for delete in [false, true] {
+                    let root = tempfile::tempdir().unwrap();
+                    let mut config = Config::default();
+                    config.storage.root = root.path().into();
+                    config.writes.writer_lanes = lanes;
+                    let store = Coordinator::open(config).await.unwrap();
+                    let bytes =
+                        Bytes::from_static(b"same-shard mutation guards duplicate fast ack");
+                    let hash = store.put(bytes.clone()).await.unwrap().hash;
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while store.writer_state.pending(&hash) != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let epoch = store.read_epoch.load(Ordering::Acquire);
+                    let (ready, paused) = oneshot::channel();
+                    let (release_probe, wait_probe) = oneshot::channel();
+                    *store.put_probe_hook.lock() = Some((ready, wait_probe));
+                    let put = {
+                        let store = store.clone();
+                        let bytes = bytes.clone();
+                        tokio::spawn(async move { store.put(bytes).await })
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), paused)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // Occupy the only blocking worker after the duplicate probe:
+                    // the earlier queued mutation cannot publish or advance epoch.
+                    let (started, wait_started) = oneshot::channel();
+                    let (release_io, wait_io) = std::sync::mpsc::channel();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        started.send(()).unwrap();
+                        wait_io.recv().unwrap();
+                    });
+                    wait_started.await.unwrap();
+                    let request = store.requests.clone().acquire_owned().await.unwrap();
+                    let message = if delete {
+                        let (response, _wait) = oneshot::channel();
+                        WriteMessage::Delete {
+                            hash,
+                            response,
+                            _request: request,
+                            ticket: store.writer_state.delete_ticket(hash, Instant::now()),
+                        }
+                    } else {
+                        let payload = store.store.prepare_put(bytes.clone()).unwrap();
+                        let permit = store
+                            .write_budget
+                            .clone()
+                            .acquire_many_owned(payload.len() as u32)
+                            .await
+                            .unwrap();
+                        let (response, _wait) = oneshot::channel();
+                        WriteMessage::Put(WriteRequest {
+                            payload,
+                            response,
+                            _permit: permit,
+                            _request: request,
+                            ticket: store.writer_state.ticket(hash, bytes.len(), Instant::now()),
+                        })
+                    };
+                    {
+                        let _admission = store.admission.lock().await;
+                        store.write_tx.send(message).await.unwrap();
+                    }
+                    assert_eq!(store.read_epoch.load(Ordering::Acquire), epoch);
+                    release_probe.send(()).unwrap();
+                    let result = if delete {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while store.writer_state.pending(&hash) != 2 {
+                                assert!(
+                                    !put.is_finished(),
+                                    "fast duplicate must not bypass pending deletion"
+                                );
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        release_io.send(()).unwrap();
+                        blocker.await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), put)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap()
+                    } else {
+                        let result = tokio::time::timeout(Duration::from_millis(500), put)
+                            .await
+                            .expect("committed duplicate need not wait for a queued PUT")
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(store.writer_state.pending(&hash), 1);
+                        release_io.send(()).unwrap();
+                        blocker.await.unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while store.writer_state.pending(&hash) != 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        result
+                    };
+                    assert_eq!(result.duplicate, !delete);
+                    assert_eq!(store.store.get(&hash).unwrap().unwrap(), bytes);
+                    assert_eq!(
+                        store.read_epoch.load(Ordering::Acquire),
+                        epoch + u64::from(delete)
+                    );
+                    store.shutdown().await.unwrap();
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn duplicate_probe_rechecks_publication_fault_before_fast_ack() {
+        for lanes in [1, 2, 4, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.storage.root = root.path().into();
+            config.writes.writer_lanes = lanes;
+            let store = Coordinator::open(config).await.unwrap();
+            let bytes =
+                Bytes::from_static(b"published duplicate must not bypass a new publication fault");
+            let hash = store.put(bytes.clone()).await.unwrap().hash;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while store.writer_state.pending(&hash) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let epoch = store.read_epoch.load(Ordering::Acquire);
+            let (ready, paused) = oneshot::channel();
+            let (release, wait) = oneshot::channel();
+            *store.put_probe_hook.lock() = Some((ready, wait));
+            let put = {
+                let store = store.clone();
+                tokio::spawn(async move { store.put(bytes).await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), paused)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut cached_status = store.status().await.unwrap();
+            assert_eq!(cached_status.health, "running");
+            // Simulate failure after probing but before the coordinator has
+            // copied the engine's global publication fault into its counters.
+            store.store.set_publication_fault_for_test(true);
+            assert!(!store.is_ready());
+            assert_eq!(store.status().await.unwrap().health, "write-faulted");
+            store.refresh_live_status(&mut cached_status);
+            assert_eq!(cached_status.health, "write-faulted");
+            let metrics = store.metrics();
+            assert!(metrics.contains("skerry_ready 0\n"));
+            assert!(metrics.contains("skerry_writer_faulted 1\n"));
+            assert!(!store.counters.faulted.load(Ordering::Acquire));
+            assert_eq!(store.read_epoch.load(Ordering::Acquire), epoch);
+            assert_eq!(store.writer_state.pending_deletes(&hash), 0);
+            release.send(()).unwrap();
+            assert!(put.await.unwrap().is_err());
+            assert_eq!(store.counters.writes.load(Ordering::Acquire), 1);
+            assert_eq!(store.writer_state.pending(&hash), 0);
+            store.store.set_publication_fault_for_test(false);
+            store.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_full_fanout_preserves_type_and_writer_remains_healthy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        let store = Coordinator::open(config).await.unwrap();
+        let (tx, rx) = oneshot::channel();
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let request = WriteRequest {
+            payload: store
+                .store
+                .prepare_put(Bytes::from_static(b"rejected"))
+                .unwrap(),
+            response: tx,
+            _permit: permit,
+            _request: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
+            ticket: store.writer_state.ticket(
+                *blake3::hash(b"rejected").as_bytes(),
+                8,
+                Instant::now(),
+            ),
+        };
+        complete_write_error(
+            &store.counters,
+            vec![request],
+            crate::engine::StorageFull.into(),
+        );
+        let error: anyhow::Error = rx.await.unwrap().err().unwrap().into();
+        assert!(error.downcast_ref::<crate::engine::StorageFull>().is_some());
+        assert!(store.is_ready());
+        store
+            .put(Bytes::from_static(b"subsequent write"))
+            .await
+            .unwrap();
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_monitors_are_reaped_on_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        let store = Coordinator::open(config).await.unwrap();
+        for _ in 0..64 {
+            let (done, wait) = tokio::sync::oneshot::channel();
+            store.register_monitor(async move {
+                let _ = done.send(());
+            });
+            wait.await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert!(store.monitor_handles.lock().len() <= 2);
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_monitor_even_if_first_shutdown_is_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        let store = Coordinator::open(config).await.unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel::<()>();
+        store.register_monitor(async move {
+            let _ = started.send(());
+            let _ = wait.await;
+        });
+        ready.await.unwrap();
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move { store.shutdown().await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!first.is_finished());
+        first.abort();
+        let second = {
+            let store = store.clone();
+            tokio::spawn(async move { store.shutdown().await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!second.is_finished());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_finalize_gate_does_not_block_small_writes_and_shutdown_drains() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        let store = Coordinator::open(config).await.unwrap();
+        let held = store
+            .stream_finalize_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            store.put(Bytes::from_static(b"small")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let shutting = {
+            let store = store.clone();
+            tokio::spawn(async move { store.shutdown().await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!shutting.is_finished());
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), shutting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_stream_finalize_and_shutdown_race() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.storage.root = root.path().into();
+        config.streaming.min_free_mib = 0;
+        let store = Coordinator::open(config).await.unwrap();
+        let storage = store.storage();
+        let mut upload = storage
+            .begin_upload(8 * 1024 * 1024, Some(4 * 1024 * 1024))
+            .unwrap();
+        let bytes = vec![71; 1024 * 1024];
+        for _ in 0..4 {
+            upload.write_chunk(&bytes).unwrap();
+        }
+        let slot = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let writing = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .finish_stream_upload(upload, slot, 4 * 1024 * 1024)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            store.put(Bytes::from_static(b"concurrent small write")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let finishing = {
+            let store = store.clone();
+            tokio::spawn(async move { store.shutdown().await })
+        };
+        writing.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finishing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn scheduled_collection_reclaims_and_shutdown_releases_store() {
         let root = tempfile::tempdir().unwrap();
@@ -1519,29 +2018,54 @@ mod cancellation_tests {
     }
     #[tokio::test]
     async fn durable_duplicates_bypass_window_but_obey_admission_and_accounting() {
-        let root = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.storage.root = root.path().into();
-        config.writes.batch_max_delay_ms = 1000;
-        let bytes = Bytes::from_static(b"already committed");
-        {
-            let store = Store::open(&config).unwrap();
-            store.put_many(std::slice::from_ref(&bytes)).unwrap();
+        for lanes in [1, 2, 4, 8] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.storage.root = root.path().into();
+            config.writes.writer_lanes = lanes;
+            config.writes.batch_max_delay_ms = 1000;
+            config.resources.admission_timeout_ms = 20;
+            let bytes = Bytes::from_static(b"already committed");
+            {
+                let store = Store::open(&config).unwrap();
+                store.put_many(std::slice::from_ref(&bytes)).unwrap();
+            }
+            let c = Coordinator::open(config).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(500), c.put(bytes.clone()))
+                .await
+                .expect("duplicate must bypass the one-second accumulation window")
+                .unwrap();
+            assert!(result.duplicate);
+            let io = c.counters.snapshot();
+            assert_eq!((io.writes, io.deduplicated, io.write_queue), (1, 1, 0));
+            assert_eq!(io.deduplicated_bytes, bytes.len() as u64);
+            let request_capacity = c.config.resources.max_requests;
+            let requests = c
+                .requests
+                .clone()
+                .acquire_many_owned(request_capacity as u32)
+                .await
+                .unwrap();
+            let error = c.put(bytes.clone()).await.err().unwrap();
+            assert!(error.downcast_ref::<ResourceExhausted>().is_some());
+            drop(requests);
+            let byte_capacity = c.config.writes.max_pending_mib * 1024 * 1024;
+            let byte_permit = c
+                .write_budget
+                .clone()
+                .acquire_many_owned(byte_capacity as u32)
+                .await
+                .unwrap();
+            let error = c.put(bytes.clone()).await.err().unwrap();
+            assert!(error.downcast_ref::<ResourceExhausted>().is_some());
+            drop(byte_permit);
+            assert_eq!(c.requests.available_permits(), request_capacity);
+            c.counters.faulted.store(true, Ordering::Release);
+            assert!(c.put(bytes.clone()).await.is_err());
+            c.counters.faulted.store(false, Ordering::Release);
+            c.shutdown().await.unwrap();
+            assert!(c.put(bytes).await.is_err());
         }
-        let c = Coordinator::open(config).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_millis(500), c.put(bytes.clone()))
-            .await
-            .expect("duplicate must bypass the one-second accumulation window")
-            .unwrap();
-        assert!(result.duplicate);
-        let io = c.counters.snapshot();
-        assert_eq!((io.writes, io.deduplicated, io.write_queue), (1, 1, 0));
-        assert_eq!(io.deduplicated_bytes, bytes.len() as u64);
-        c.counters.faulted.store(true, Ordering::Release);
-        assert!(c.put(bytes.clone()).await.is_err());
-        c.counters.faulted.store(false, Ordering::Release);
-        c.shutdown().await.unwrap();
-        assert!(c.put(bytes).await.is_err());
     }
     #[tokio::test]
     async fn abandoned_coalesced_waiters_are_pruned() {

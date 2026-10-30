@@ -1,20 +1,28 @@
 # Paths are relative to this file. Tokens belong in SKERRY_TOKEN, never here.
 [server]
 listen = "127.0.0.1:7788"
+# Optional dedicated monitoring/shutdown listener, for example:
+# admin_listen = "127.0.0.1:7789"
 request_timeout_seconds = 120
 shutdown_timeout_seconds = 30
 
 [storage]
 root = "./data"
+min_free_mib = 256 # Global minimum free-space reserve for writes/checkpoints.
 
 [segments]
 max_size_bytes = 8589934592
 growth_factor = 1 # 2 enables geometric logical growth, not disk block reservation
 
 [writes]
+writer_lanes = 1 # Opt in to 2, 4, or 8 parallel append lanes; shared durable publication.
+# Multi-lane publication coalesces ready work for at most this extra interval.
+# Sparse/skewed multi-lane traffic may wait the full interval; one lane ignores it.
+commit_max_delay_ms = 10
 batch_max_records = 512
 batch_max_delay_ms = 1
 max_pending_mib = 256
+batch_max_bytes_mib = 16 # Write aggregation target, not request admission capacity.
 
 [reads]
 policy = "ssd" # or "hdd"
@@ -28,12 +36,39 @@ max_inflight_read_mib = 256
 max_open_segments = 256
 max_requests = 128
 max_batch_items = 4096
+admission_timeout_ms = 5000
+max_inflight_per_batch = 32
+admin_max_requests = 8
 
 [cache]
 payload_mib = 256 # 0 disables payload caching
 index_mib = 128
 admission_entries = 65536
 admission_window_seconds = 300
+max_entries = 1000000 # Independent cap; metadata_mib can impose a lower effective count.
+max_object_mib = 8 # Larger individual objects bypass the payload cache.
+metadata_mib = 64 # Separate bound for cache indexes and admission history.
+shards = 16 # Power of two; fixed per-shard budgets can leave capacity unused under skew.
+
+[streaming]
+enabled = true
+threshold_mib = 8
+max_object_mib = 4096
+chunk_kib = 1024
+max_uploads = 2
+max_reads = 4
+checksum_cache_mib = 16
+transfer_timeout_seconds = 3600
+idle_timeout_seconds = 30 # Maximum wait for a streamed GET consumer before releasing its resources.
+min_free_mib = 256 # Effective write reserve is max(storage.min_free_mib, streaming.min_free_mib).
+
+[checkpoint]
+enabled = true
+interval_seconds = 300
+min_journal_mib = 256
+max_catchup_mib = 16
+max_tail_kib = 256
+batch_records = 512
 
 # Initial tunable maintenance defaults; automatic collection is opt-in.
 [gc]

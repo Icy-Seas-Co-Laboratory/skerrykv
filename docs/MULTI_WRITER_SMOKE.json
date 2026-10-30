@@ -1,0 +1,32 @@
+{
+  "binary_version": "skerry 0.4.0",
+  "checks": [
+    "authorized_idempotent_delete",
+    "empty_object_preserved",
+    "forced_collection",
+    "nonmutating_dry_run",
+    "full_vacuum",
+    "verify_and_rebuild_keep_deletion",
+    "reput_recreates"
+  ],
+  "collection": {
+    "candidate_limit": 128,
+    "copied_bytes": 131272,
+    "copy_budget_bytes": 1073741824,
+    "reclaimed_bytes": 82,
+    "relocated_objects": 3,
+    "retired_segments": 1,
+    "space_pressure": true,
+    "status": "collected"
+  },
+  "vacuum": {
+    "live_payload_bytes": 131080,
+    "objects": 3,
+    "physical_bytes_after": 131432,
+    "physical_bytes_before": 131432,
+    "reclaimed_bytes": 0,
+    "status": "vacuumed",
+    "version": 2
+  },
+  "passed": true
+}
